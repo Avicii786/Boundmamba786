@@ -7,9 +7,8 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-# Imports from your package (Updated Imports)
-from boundmamba.model import BoundMamba
-from boundmamba.losses import JointLoss
+# Imports from your package
+from boundmamba import BoundNeXt, BoundMambaLoss
 from boundmamba.utils import extract_boundary
 from boundmamba.metrics import SCDMetrics
 from dataset import SCDDataset
@@ -29,13 +28,14 @@ def set_seed(seed=42):
     print(f"Random Seed set to: {seed}")
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train BoundMamba for Semantic Change Detection")
+    parser = argparse.ArgumentParser(description="Train BoundNeXt for Semantic Change Detection")
     parser.add_argument('--data_root', type=str, required=True, help='Path to SECOND or LandsatSCD dataset root')
     parser.add_argument('--dataset_name', type=str, default='SECOND', choices=['SECOND', 'LandsatSCD'])
+    parser.add_argument('--model_type', type=str, default='convnextv2_tiny', help='Backbone model type (e.g., convnextv2_tiny, convnextv2_base)')
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--lr', type=float, default=0.0003)
-    parser.add_argument('--weights', type=str, default=None, help='Path to VMamba pretrained weights')
+    parser.add_argument('--weights', type=str, default=None, help='Path to ConvNeXtV2 pretrained weights')
     parser.add_argument('--save_dir', type=str, default='./checkpoints')
     parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
     return parser.parse_args()
@@ -50,10 +50,14 @@ def train(args):
     # Get num_classes from dataset config
     num_classes = 7 if args.dataset_name == 'SECOND' else 5
     
-    print(f"Initializing BoundMamba (Num Classes: {num_classes})...")
-    model = BoundMamba(num_classes=num_classes, pretrained=args.weights).to(device)
-    # Updated: Changed BoundMambaLoss() to JointLoss()
-    criterion = JointLoss().to(device)
+    print(f"Initializing BoundNeXt (Num Classes: {num_classes}, Backbone: {args.model_type})...")
+    model = BoundNeXt(
+        num_classes=num_classes, 
+        pretrained_path=args.weights,
+        model_type=args.model_type
+    ).to(device)
+    
+    criterion = BoundMambaLoss().to(device)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     
@@ -67,13 +71,13 @@ def train(args):
         root=args.data_root, 
         mode='train', 
         dataset_name=args.dataset_name, 
-        patch_mode=False  # Changed to False for 512x512 training
+        patch_mode=False  # Full 512x512 training
     )
     val_set = SCDDataset(
         root=args.data_root, 
         mode='val', 
         dataset_name=args.dataset_name, 
-        patch_mode=False  # Changed to False for 512x512 validation
+        patch_mode=False  # Full 512x512 validation
     )
     
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
@@ -128,10 +132,10 @@ def train(args):
         # Checkpoint
         if score > best_score:
             best_score = score
-            torch.save(model.state_dict(), os.path.join(args.save_dir, 'boundmamba_best.pth'))
-            print(f"New Best Score: {best_score:.4f} (Saved)")
+            torch.save(model.state_dict(), os.path.join(args.save_dir, 'boundnext_best.pth'))
+            print(f"New Best Score: {best_score:.4f} (Saved to boundnext_best.pth)")
         
-        torch.save(model.state_dict(), os.path.join(args.save_dir, 'boundmamba_last.pth'))
+        torch.save(model.state_dict(), os.path.join(args.save_dir, 'boundnext_last.pth'))
 
 def validate(model, loader, metrics, device, epoch):
     model.eval()
