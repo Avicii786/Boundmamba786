@@ -12,9 +12,9 @@ import torch.utils.checkpoint as checkpoint
 from einops import rearrange, repeat
 from timm.models.layers import DropPath, trunc_normal_, to_2tuple
 
-# FIXED: Using PyTorch reference scan to bypass Kaggle T4 CUDA compilation errors
+# FIXED: Using the native optimized CUDA kernel since you compiled from source!
 try:
-    from mamba_ssm.ops.selective_scan_interface import selective_scan_ref as selective_scan_fn
+    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
 except ImportError:
     raise ImportError("mamba_ssm is not installed. Please install it via `pip install mamba_ssm`")
 
@@ -74,7 +74,7 @@ class CrossMerge(torch.autograd.Function):
     @staticmethod
     def backward(ctx, x: torch.Tensor):
         H, W = ctx.shape
-        # FIXED: x is 4D (B, C, H, W), so we unpack 4 values instead of 3
+        # FIXED: Unpack 4 dimensions since x is [B, C, H, W]
         B, C, _H, _W = x.shape
         L = H * W
         x = x.view(B, C, H, W)
@@ -210,6 +210,7 @@ class SS2D(nn.Module):
         # Selective Scan Execution (Process 4 directions)
         out_y = []
         for i in range(4):
+            # FIXED: Removed .permute(0, 2, 1) to match mamba_ssm shape expectations
             yi = selective_scan_fn(
                 xs.view(B, 4, -1, H*W)[:, i],
                 dts.view(B, 4, -1, H*W)[:, i],
@@ -223,6 +224,7 @@ class SS2D(nn.Module):
             out_y.append(yi)
             
         y = torch.stack(out_y, dim=1) 
+        # FIXED: Removed .permute(0, 1, 3, 2) since inputs weren't permuted
         y = y.contiguous().view(B, 4, -1, H, W)
         
         # Cross Merge
