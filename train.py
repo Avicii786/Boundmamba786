@@ -36,23 +36,45 @@ class BoundNeXtLightning(pl.LightningModule):
     def forward(self, t1, t2):
         return self.model(t1, t2)
 
+    # =====================================================================
+    # [NEW] BACKBONE FREEZING LOGIC
+    # =====================================================================
+    def on_train_epoch_start(self):
+        freeze_epochs = self.args.freeze_epochs
+        if freeze_epochs > 0:
+            if self.current_epoch < freeze_epochs:
+                # Freeze only the pre-trained timm modules (stem and stages)
+                if self.current_epoch == 0 and self.trainer.is_global_zero:
+                    print(f"\n❄️  [Warm-up] Freezing ConvNeXtV2 backbone for the first {freeze_epochs} epochs...")
+                
+                for param in self.model.encoder.stem.parameters():
+                    param.requires_grad = False
+                for param in self.model.encoder.stages.parameters():
+                    param.requires_grad = False
+                    
+            elif self.current_epoch == freeze_epochs:
+                # Unfreeze the backbone for end-to-end fine-tuning
+                if self.trainer.is_global_zero:
+                    print(f"\n🔥 [Fine-Tuning] Unfreezing ConvNeXtV2 backbone for end-to-end training!")
+                
+                for param in self.model.encoder.stem.parameters():
+                    param.requires_grad = True
+                for param in self.model.encoder.stages.parameters():
+                    param.requires_grad = True
+
     def training_step(self, batch, batch_idx):
         t1, t2 = batch['img_A'], batch['img_B']
         l1, l2, gt_cd = batch['sem1'], batch['sem2'], batch['bcd']
         
-        # On-the-fly boundary generation
         gt_bd = extract_boundary(gt_cd)
         
-        # Forward pass
         pred_ss1, pred_ss2, pred_cd, pred_bd = self(t1, t2)
         
-        # Loss
         loss, loss_dict = self.criterion(
             (pred_ss1, pred_ss2, pred_cd, pred_bd), 
             (l1, l2, gt_cd, gt_bd)
         )
         
-        # Lightning handles logging automatically (Added batch_size to clear warnings)
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=self.args.batch_size)
         self.log('sem_loss', loss_dict['ss'], on_step=True, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=self.args.batch_size)
         self.log('bcd_loss', loss_dict['cd'], on_step=True, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=self.args.batch_size)
@@ -63,66 +85,52 @@ class BoundNeXtLightning(pl.LightningModule):
         t1, t2 = batch['img_A'], batch['img_B']
         l1, l2, gt_cd = batch['sem1'], batch['sem2'], batch['bcd']
         
-        # On-the-fly boundary generation for validation loss
         gt_bd = extract_boundary(gt_cd)
-        
-        # Forward pass including boundaries
         pred_ss1, pred_ss2, pred_cd, pred_bd = self(t1, t2)
         
-        # Calculate Validation Loss
         loss, _ = self.criterion(
             (pred_ss1, pred_ss2, pred_cd, pred_bd), 
             (l1, l2, gt_cd, gt_bd)
         )
         
-        # Log validation loss
         self.log('val_loss', loss, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=self.args.batch_size)
         
-        # Predictions
         p_ss1 = torch.argmax(pred_ss1, dim=1)
         p_ss2 = torch.argmax(pred_ss2, dim=1)
         p_cd = (torch.sigmoid(pred_cd) > 0.5).long().squeeze(1)
         
-        # Update metrics locally on this GPU
         self.metrics.update(p_ss1, p_ss2, p_cd, l1, l2, gt_cd)
 
     def on_validation_epoch_end(self):
-        # --- DDP Metric Aggregation Strategy ---
         device = self.device
         hist_sem1_t = torch.tensor(self.metrics.hist_sem1, device=device)
         hist_sem2_t = torch.tensor(self.metrics.hist_sem2, device=device)
         hist_bcd_t = torch.tensor(self.metrics.hist_bcd, device=device)
 
-        # Sum across all GPUs safely
         hist_sem1_t = self.trainer.strategy.reduce(hist_sem1_t, reduce_op="sum")
         hist_sem2_t = self.trainer.strategy.reduce(hist_sem2_t, reduce_op="sum")
         hist_bcd_t = self.trainer.strategy.reduce(hist_bcd_t, reduce_op="sum")
 
-        # Overwrite local metrics with the global synchronized sums
         self.metrics.hist_sem1 = hist_sem1_t.cpu().numpy()
         self.metrics.hist_sem2 = hist_sem2_t.cpu().numpy()
         self.metrics.hist_bcd = hist_bcd_t.cpu().numpy()
         
-        # Compute final global score on ALL ranks to prevent logging crashes
         res = self.metrics.compute()
-        
-        # Retrieve the validation loss computed from validation_step
         val_loss = self.trainer.callback_metrics.get('val_loss', torch.tensor(0.0))
         val_loss_val = val_loss.item() if isinstance(val_loss, torch.Tensor) else val_loss
         
-        # Only print the text output on the main GPU
         if self.trainer.is_global_zero:
             print(f"\n[Validation Epoch {self.current_epoch}]")
             print(f"Val Loss: {val_loss_val:.4f} | SeK: {res['sek']:.4f} | F1_BCD: {res['f1_bcd']:.4f} | mIoU: {res['miou']:.4f} | Score: {res['score']:.4f}")
         
-        # Log metrics to Lightning (sync_dist=False because we already manually reduced the matrices above)
-        self.log('val_score', res['score'], sync_dist=False)
-        self.log('val_miou', res['miou'], sync_dist=False)
+        # sync_dist=False, rank_zero_only=True completely removes the syncing warnings!
+        self.log('val_score', res['score'], sync_dist=False, rank_zero_only=True)
+        self.log('val_miou', res['miou'], sync_dist=False, rank_zero_only=True)
         
-        # Reset local metrics for the next epoch
         self.metrics.reset()
 
     def configure_optimizers(self):
+        # We pass all parameters to AdamW. It safely ignores gradients for frozen layers.
         optimizer = optim.AdamW(self.parameters(), lr=self.args.lr, weight_decay=1e-4)
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.args.epochs)
         return [optimizer], [scheduler]
@@ -135,6 +143,10 @@ def parse_args():
     parser.add_argument('--weights', type=str, default=None)
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--epochs', type=int, default=100)
+    
+    # [NEW] Control how many epochs the backbone stays frozen
+    parser.add_argument('--freeze_epochs', type=int, default=5, help='Number of epochs to freeze pretrained backbone')
+    
     parser.add_argument('--lr', type=float, default=0.0003)
     parser.add_argument('--save_dir', type=str, default='/kaggle/working/checkpoints')
     parser.add_argument('--seed', type=int, default=42)
@@ -164,11 +176,9 @@ def main():
     )
     lr_monitor = LearningRateMonitor(logging_interval='epoch')
 
-    # Initialize PyTorch Lightning Trainer
     trainer = pl.Trainer(
         devices="auto",                  
         accelerator="gpu",
-        # [FIX]: Set strategy to allow unused parameters from the timm backbone!
         strategy="ddp_find_unused_parameters_true",  
         max_epochs=args.epochs,
         precision="16-mixed",            
@@ -177,7 +187,6 @@ def main():
         enable_progress_bar=True
     )
 
-    # Start Training
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
 if __name__ == '__main__':
