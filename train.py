@@ -7,8 +7,8 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-# Import AMP scaler
-from torch.cuda.amp import autocast, GradScaler
+# [UPDATED] Use modern PyTorch 2.x AMP imports
+from torch.amp import autocast, GradScaler
 
 # Imports from your package
 from boundmamba import BoundNeXt, BoundMambaLoss
@@ -64,8 +64,8 @@ def train(args):
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     
-    # Initialize the GradScaler for Mixed Precision
-    scaler = GradScaler(enabled=torch.cuda.is_available())
+    # [UPDATED] Initialize the modern GradScaler specifying 'cuda'
+    scaler = GradScaler('cuda', enabled=torch.cuda.is_available())
     
     metrics = SCDMetrics(num_classes=num_classes)
 
@@ -73,7 +73,6 @@ def train(args):
     train_set = SCDDataset(root=args.data_root, mode='train', dataset_name=args.dataset_name, patch_mode=False)
     val_set = SCDDataset(root=args.data_root, mode='val', dataset_name=args.dataset_name, patch_mode=False)
     
-    # num_workers=0 is safe for Kaggle shared memory limits
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=0, pin_memory=True)
     val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=0, pin_memory=True)
 
@@ -97,8 +96,8 @@ def train(args):
             
             optimizer.zero_grad()
             
-            # Use Autocast for the forward pass
-            with autocast(enabled=torch.cuda.is_available()):
+            # [UPDATED] Use modern Autocast specifying 'cuda'
+            with autocast('cuda', enabled=torch.cuda.is_available()):
                 pred_ss1, pred_ss2, pred_cd, pred_bd = model(t1, t2)
                 loss, loss_dict = criterion((pred_ss1, pred_ss2, pred_cd, pred_bd), (l1, l2, gt_cd, gt_bd))
             
@@ -136,8 +135,8 @@ def validate(model, loader, metrics, device, epoch):
             l2 = batch['sem2'].to(device)
             gt_cd = batch['bcd'].to(device)
             
-            # Autocast during validation speeds up inference too
-            with autocast(enabled=torch.cuda.is_available()):
+            # [UPDATED] Modern Autocast for validation
+            with autocast('cuda', enabled=torch.cuda.is_available()):
                 pred_ss1, pred_ss2, pred_cd, _ = model(t1, t2)
             
             p_ss1 = torch.argmax(pred_ss1, dim=1)
