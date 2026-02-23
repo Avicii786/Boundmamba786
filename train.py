@@ -54,7 +54,8 @@ class BoundNeXtLightning(pl.LightningModule):
         
         # Lightning handles logging automatically (Added batch_size to clear warnings)
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=self.args.batch_size)
-        self.log('cd_loss', loss_dict['cd'], on_step=True, on_epoch=False, prog_bar=True, sync_dist=True, batch_size=self.args.batch_size)
+        self.log('sem_loss', loss_dict['ss'], on_step=True, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=self.args.batch_size)
+        self.log('bcd_loss', loss_dict['cd'], on_step=True, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=self.args.batch_size)
         
         return loss
 
@@ -62,7 +63,20 @@ class BoundNeXtLightning(pl.LightningModule):
         t1, t2 = batch['img_A'], batch['img_B']
         l1, l2, gt_cd = batch['sem1'], batch['sem2'], batch['bcd']
         
-        pred_ss1, pred_ss2, pred_cd, _ = self(t1, t2)
+        # On-the-fly boundary generation for validation loss
+        gt_bd = extract_boundary(gt_cd)
+        
+        # Forward pass including boundaries
+        pred_ss1, pred_ss2, pred_cd, pred_bd = self(t1, t2)
+        
+        # Calculate Validation Loss
+        loss, _ = self.criterion(
+            (pred_ss1, pred_ss2, pred_cd, pred_bd), 
+            (l1, l2, gt_cd, gt_bd)
+        )
+        
+        # Log validation loss
+        self.log('val_loss', loss, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=self.args.batch_size)
         
         # Predictions
         p_ss1 = torch.argmax(pred_ss1, dim=1)
@@ -92,10 +106,14 @@ class BoundNeXtLightning(pl.LightningModule):
         # Compute final global score on ALL ranks to prevent logging crashes
         res = self.metrics.compute()
         
+        # Retrieve the validation loss computed from validation_step
+        val_loss = self.trainer.callback_metrics.get('val_loss', torch.tensor(0.0))
+        val_loss_val = val_loss.item() if isinstance(val_loss, torch.Tensor) else val_loss
+        
         # Only print the text output on the main GPU
         if self.trainer.is_global_zero:
             print(f"\n[Validation Epoch {self.current_epoch}]")
-            print(f"SeK: {res['sek']:.4f} | F1_BCD: {res['f1_bcd']:.4f} | mIoU: {res['miou']:.4f} | Score: {res['score']:.4f}")
+            print(f"Val Loss: {val_loss_val:.4f} | SeK: {res['sek']:.4f} | F1_BCD: {res['f1_bcd']:.4f} | mIoU: {res['miou']:.4f} | Score: {res['score']:.4f}")
         
         # Log metrics to Lightning (sync_dist=False because we already manually reduced the matrices above)
         self.log('val_score', res['score'], sync_dist=False)
