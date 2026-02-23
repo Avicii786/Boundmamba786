@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .backbone import Backbone_VSSM
+from .backbone import SiameseConvNeXtV2
 from .modules import SC_UP_Module, BGI_Module, UWFF_Head
 
 class DecoderBlock(nn.Module):
@@ -25,18 +25,17 @@ class DecoderBlock(nn.Module):
             x = torch.cat([x, skip], dim=1)
         return self.conv(x)
 
-class BoundMamba(nn.Module):
-    def __init__(self, num_classes=7, pretrained=None):
+class BoundNeXt(nn.Module):
+    def __init__(self, num_classes=7, pretrained_path=None, model_type='convnextv2_tiny'):
         super().__init__()
         
-        # 1. Siamese VMamba Encoder (Shared Weights)
-        # Note: We do NOT pass two inputs here. We init a standard backbone.
-        self.encoder = Backbone_VSSM(
-            dims=[96, 192, 384, 768], 
-            depths=[2, 2, 9, 2], 
-            pretrained=pretrained
+        # 1. Siamese ConvNeXtV2 with TDTI Encoder
+        self.encoder = SiameseConvNeXtV2(
+            model_type=model_type,
+            checkpoint_path=pretrained_path,
+            drop_path_rate=0.2
         )
-        dims = self.encoder.dims 
+        dims = self.encoder.dims # [96, 192, 384, 768]
         
         # 2. Bottleneck (SC-UP)
         self.sc_up = SC_UP_Module(dims[3])
@@ -49,7 +48,7 @@ class BoundMamba(nn.Module):
             nn.Conv2d(64, 1, 1)
         )
 
-        # 4. Decoders
+        # 4. Decoders (3 Streams)
         self.dec_ss1_3 = DecoderBlock(dims[3], dims[2], dims[2])
         self.dec_ss1_2 = DecoderBlock(dims[2], dims[1], dims[1])
         self.dec_ss1_1 = DecoderBlock(dims[1], dims[0], dims[0])
@@ -62,7 +61,7 @@ class BoundMamba(nn.Module):
         self.dec_cd_2 = DecoderBlock(dims[2], 0, dims[1])
         self.dec_cd_1 = DecoderBlock(dims[1], 0, dims[0])
         
-        # 5. Interaction Modules
+        # 5. Task Interaction Modules (BGI)
         self.bgi_3 = BGI_Module(dims[2])
         self.bgi_2 = BGI_Module(dims[1])
         self.bgi_1 = BGI_Module(dims[0])
@@ -73,10 +72,8 @@ class BoundMamba(nn.Module):
     def forward(self, t1, t2):
         img_size = t1.shape[2:]
         
-        # --- Encoding (SIAMESE) ---
-        # Explicitly call encoder twice
-        f1_list = self.encoder(t1) # [s4, s8, s16, s32]
-        f2_list = self.encoder(t2)
+        # --- Encoding with Temporal Interaction (TDTI) ---
+        f1_list, f2_list = self.encoder(t1, t2)
         
         # --- Boundary Task ---
         diff_low = torch.abs(f1_list[0] - f2_list[0])
@@ -92,21 +89,21 @@ class BoundMamba(nn.Module):
         x2 = self.dec_ss2_3(f2_3, f2_list[2])
         
         cd_x = self.dec_cd_3(cd_3)
-        cd_x = self.bgi_3(x1, x2, cd_x, boundary_map)
+        cd_x = self.bgi_3(x1, x2, cd_x, boundary_map) # Task Interaction
         
         # --- Stage 2 (s16 -> s8) ---
         x1 = self.dec_ss1_2(x1, f1_list[1])
         x2 = self.dec_ss2_2(x2, f2_list[1])
         
         cd_x = self.dec_cd_2(cd_x)
-        cd_x = self.bgi_2(x1, x2, cd_x, boundary_map)
+        cd_x = self.bgi_2(x1, x2, cd_x, boundary_map) # Task Interaction
         
         # --- Stage 1 (s8 -> s4) ---
         x1 = self.dec_ss1_1(x1, f1_list[0])
         x2 = self.dec_ss2_1(x2, f2_list[0])
         
         cd_x = self.dec_cd_1(cd_x)
-        cd_x = self.bgi_1(x1, x2, cd_x, boundary_map)
+        cd_x = self.bgi_1(x1, x2, cd_x, boundary_map) # Task Interaction
         
         # --- Heads ---
         out_ss1, out_ss2, out_cd = self.head(x1, x2, cd_x)
