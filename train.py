@@ -7,7 +7,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
+from pytorch_lightning.callbacks import ModelCheckpoint
 
 # Imports from your package
 from boundmamba import BoundNeXt, BoundMambaLoss
@@ -62,7 +62,6 @@ class BoundNeXtLightning(pl.LightningModule):
         l1, l2, gt_cd = batch['sem1'], batch['sem2'], batch['bcd']
         
         gt_bd = extract_boundary(gt_cd)
-        
         pred_ss1, pred_ss2, pred_cd, pred_bd = self(t1, t2)
         
         loss, loss_dict = self.criterion(
@@ -70,26 +69,22 @@ class BoundNeXtLightning(pl.LightningModule):
             (l1, l2, gt_cd, gt_bd)
         )
         
-        # Logging with on_epoch=True appends "_epoch" to the keys for end-of-epoch retrieval
-        self.log('train_loss', loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=self.args.batch_size)
-        self.log('sem_loss', loss_dict['ss'], on_step=True, on_epoch=True, sync_dist=True, batch_size=self.args.batch_size)
-        self.log('bcd_loss', loss_dict['cd'], on_step=True, on_epoch=True, sync_dist=True, batch_size=self.args.batch_size)
+        # Log values for internal callback metrics (needed for on_train_epoch_end)
+        self.log('train_loss', loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=self.args.batch_size)
+        self.log('sem_loss', loss_dict['ss'], on_step=False, on_epoch=True, sync_dist=True, batch_size=self.args.batch_size)
+        self.log('bcd_loss', loss_dict['cd'], on_step=False, on_epoch=True, sync_dist=True, batch_size=self.args.batch_size)
         
         return loss
 
-    # =====================================================================
-    # [NEW] CLEAN TRAINING LOG OUTPUT
-    # =====================================================================
     def on_train_epoch_end(self):
         if self.trainer.is_global_zero:
-            # Helper safely extracts values whether they are tensors or floats
             def get_val(key):
                 val = self.trainer.callback_metrics.get(key, 0.0)
                 return val.item() if isinstance(val, torch.Tensor) else val
             
-            t_loss = get_val('train_loss_epoch')
-            s_loss = get_val('sem_loss_epoch')
-            c_loss = get_val('bcd_loss_epoch')
+            t_loss = get_val('train_loss')
+            s_loss = get_val('sem_loss')
+            c_loss = get_val('bcd_loss')
             
             print(f"\n[Train Epoch {self.current_epoch}] Total Loss: {t_loss:.4f} | SEM Loss: {s_loss:.4f} | BCD Loss: {c_loss:.4f}")
 
@@ -128,11 +123,9 @@ class BoundNeXtLightning(pl.LightningModule):
         self.metrics.hist_bcd = hist_bcd_t.cpu().numpy()
         
         res = self.metrics.compute()
-        
         val_loss = self.trainer.callback_metrics.get('val_loss', torch.tensor(0.0))
         val_loss_val = val_loss.item() if isinstance(val_loss, torch.Tensor) else val_loss
         
-        # Clean Output for Validation
         if self.trainer.is_global_zero:
             print(f"[Valid Epoch {self.current_epoch}] Val Loss: {val_loss_val:.4f} | SeK: {res['sek']:.4f} | F1_BCD: {res['f1_bcd']:.4f} | mIoU: {res['miou']:.4f} | Score: {res['score']:.4f}")
             print("-" * 75)
@@ -155,7 +148,7 @@ def parse_args():
     parser.add_argument('--weights', type=str, default=None)
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--freeze_epochs', type=int, default=5, help='Number of epochs to freeze pretrained backbone')
+    parser.add_argument('--freeze_epochs', type=int, default=5)
     parser.add_argument('--lr', type=float, default=0.0003)
     parser.add_argument('--save_dir', type=str, default='/kaggle/working/checkpoints')
     parser.add_argument('--seed', type=int, default=42)
@@ -163,7 +156,6 @@ def parse_args():
 
 def main():
     args = parse_args()
-    
     pl.seed_everything(args.seed, workers=True)
     os.makedirs(args.save_dir, exist_ok=True)
 
@@ -183,7 +175,6 @@ def main():
         mode="max",
         save_last=True
     )
-    lr_monitor = LearningRateMonitor(logging_interval='epoch')
 
     trainer = pl.Trainer(
         devices="auto",                  
@@ -191,13 +182,13 @@ def main():
         strategy="ddp_find_unused_parameters_true",  
         max_epochs=args.epochs,
         precision="16-mixed",            
-        callbacks=[checkpoint_callback, lr_monitor],
-        enable_progress_bar=False,  # <--- [FIX] Disables the spammy TQDM bar for background runs!
-        logger=False                # Optionally set to True if you want to use Tensorboard
+        callbacks=[checkpoint_callback], # Removed LearningRateMonitor to prevent crash
+        enable_progress_bar=False,
+        logger=False 
     )
 
     if trainer.is_global_zero:
-        print("\n🚀 Training Starting... (Progress bar disabled for clean Kaggle background logs)\n")
+        print("\n🚀 Training Starting... (Background Run Mode)\n")
 
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
