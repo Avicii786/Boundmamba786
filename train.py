@@ -7,8 +7,9 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-# Imports from your package
-from boundmamba import BoundMamba, BoundMambaLoss
+# Imports from your package (Updated Imports)
+from boundmamba.model import BoundMamba
+from boundmamba.losses import JointLoss
 from boundmamba.utils import extract_boundary
 from boundmamba.metrics import SCDMetrics
 from dataset import SCDDataset
@@ -51,7 +52,8 @@ def train(args):
     
     print(f"Initializing BoundMamba (Num Classes: {num_classes})...")
     model = BoundMamba(num_classes=num_classes, pretrained=args.weights).to(device)
-    criterion = BoundMambaLoss().to(device)
+    # Updated: Changed BoundMambaLoss() to JointLoss()
+    criterion = JointLoss().to(device)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     
