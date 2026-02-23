@@ -35,7 +35,7 @@ class BoundNeXt(nn.Module):
             checkpoint_path=pretrained_path,
             drop_path_rate=0.2
         )
-        dims = self.encoder.dims # [96, 192, 384, 768]
+        dims = self.encoder.dims # Automatically adjusts based on tiny/small/base
         
         # 2. Bottleneck (SC-UP)
         self.sc_up = SC_UP_Module(dims[3])
@@ -89,21 +89,21 @@ class BoundNeXt(nn.Module):
         x2 = self.dec_ss2_3(f2_3, f2_list[2])
         
         cd_x = self.dec_cd_3(cd_3)
-        cd_x = self.bgi_3(x1, x2, cd_x, boundary_map) # Task Interaction
+        cd_x = self.bgi_3(x1, x2, cd_x, boundary_map) 
         
         # --- Stage 2 (s16 -> s8) ---
         x1 = self.dec_ss1_2(x1, f1_list[1])
         x2 = self.dec_ss2_2(x2, f2_list[1])
         
         cd_x = self.dec_cd_2(cd_x)
-        cd_x = self.bgi_2(x1, x2, cd_x, boundary_map) # Task Interaction
+        cd_x = self.bgi_2(x1, x2, cd_x, boundary_map) 
         
         # --- Stage 1 (s8 -> s4) ---
         x1 = self.dec_ss1_1(x1, f1_list[0])
         x2 = self.dec_ss2_1(x2, f2_list[0])
         
         cd_x = self.dec_cd_1(cd_x)
-        cd_x = self.bgi_1(x1, x2, cd_x, boundary_map) # Task Interaction
+        cd_x = self.bgi_1(x1, x2, cd_x, boundary_map) 
         
         # --- Heads ---
         out_ss1, out_ss2, out_cd = self.head(x1, x2, cd_x)
