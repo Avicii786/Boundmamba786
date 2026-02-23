@@ -208,12 +208,13 @@ class SS2D(nn.Module):
         # Selective Scan Execution (Process 4 directions)
         out_y = []
         for i in range(4):
+            # FIXED: Removed .permute(0, 2, 1) from inputs to match mamba_ssm shape (B, D, L)
             yi = selective_scan_fn(
-                xs.view(B, 4, -1, H*W)[:, i].permute(0, 2, 1),
-                dts.view(B, 4, -1, H*W)[:, i].permute(0, 2, 1),
+                xs.view(B, 4, -1, H*W)[:, i],
+                dts.view(B, 4, -1, H*W)[:, i],
                 As[i*self.d_inner:(i+1)*self.d_inner],
-                Bs[:, i].permute(0, 2, 1),
-                Cs[:, i].permute(0, 2, 1),
+                Bs[:, i],
+                Cs[:, i],
                 Ds[i*self.d_inner:(i+1)*self.d_inner],
                 delta_bias=dt_projs_bias[i*self.d_inner:(i+1)*self.d_inner],
                 delta_softplus=True
@@ -221,7 +222,8 @@ class SS2D(nn.Module):
             out_y.append(yi)
             
         y = torch.stack(out_y, dim=1) 
-        y = y.permute(0, 1, 3, 2).contiguous().view(B, 4, -1, H, W)
+        # FIXED: Since inputs are (B, D, L), yi is (B, D, L), y is (B, 4, D, L). No permutation needed.
+        y = y.contiguous().view(B, 4, -1, H, W)
         
         # Cross Merge
         y = CrossMerge.apply(y) # (B, D, H, W)
