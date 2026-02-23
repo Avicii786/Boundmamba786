@@ -1,116 +1,167 @@
+import os
+import argparse
+import random
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from .backbone import SiameseConvNeXtV2
-from .modules import SC_UP_Module, BGI_Module, UWFF_Head
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
-class DecoderBlock(nn.Module):
-    def __init__(self, in_ch, skip_ch, out_ch):
-        super().__init__()
-        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_ch + skip_ch, out_ch, 3, padding=1),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, 3, padding=1),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True)
-        )
+from torch.amp import autocast, GradScaler
 
-    def forward(self, x, skip=None):
-        x = self.up(x)
-        if skip is not None:
-            if x.shape[2:] != skip.shape[2:]:
-                x = F.interpolate(x, size=skip.shape[2:], mode='bilinear')
-            x = torch.cat([x, skip], dim=1)
-        return self.conv(x)
+# Imports from your package
+from boundmamba import BoundNeXt, BoundMambaLoss
+from boundmamba.utils import extract_boundary
+from boundmamba.metrics import SCDMetrics
+from dataset import SCDDataset
 
-class BoundNeXt(nn.Module):
-    def __init__(self, num_classes=7, pretrained_path=None, model_type='convnextv2_tiny'):
-        super().__init__()
-        
-        # 1. Siamese ConvNeXtV2 with TDTI Encoder
-        self.encoder = SiameseConvNeXtV2(
-            model_type=model_type,
-            checkpoint_path=pretrained_path,
-            drop_path_rate=0.2
-        )
-        dims = self.encoder.dims # Automatically adjusts based on tiny/small/base
-        
-        # 2. Bottleneck (SC-UP)
-        self.sc_up = SC_UP_Module(dims[3])
-        
-        # 3. Boundary Branch (Auxiliary)
-        self.boundary_head = nn.Sequential(
-            nn.Conv2d(dims[0], 64, 3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.Conv2d(64, 1, 1)
-        )
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    print(f"[Setup] Random Seed securely set to: {seed}")
 
-        # 4. Decoders (3 Streams)
-        self.dec_ss1_3 = DecoderBlock(dims[3], dims[2], dims[2])
-        self.dec_ss1_2 = DecoderBlock(dims[2], dims[1], dims[1])
-        self.dec_ss1_1 = DecoderBlock(dims[1], dims[0], dims[0])
-        
-        self.dec_ss2_3 = DecoderBlock(dims[3], dims[2], dims[2])
-        self.dec_ss2_2 = DecoderBlock(dims[2], dims[1], dims[1])
-        self.dec_ss2_1 = DecoderBlock(dims[1], dims[0], dims[0])
-        
-        self.dec_cd_3 = DecoderBlock(dims[3], 0, dims[2])
-        self.dec_cd_2 = DecoderBlock(dims[2], 0, dims[1])
-        self.dec_cd_1 = DecoderBlock(dims[1], 0, dims[0])
-        
-        # 5. Task Interaction Modules (BGI)
-        self.bgi_3 = BGI_Module(dims[2])
-        self.bgi_2 = BGI_Module(dims[1])
-        self.bgi_1 = BGI_Module(dims[0])
-        
-        # 6. Final Head
-        self.head = UWFF_Head(dims[0], num_classes)
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train BoundNeXt for Semantic Change Detection")
+    parser.add_argument('--data_root', type=str, required=True, help='Path to dataset root')
+    parser.add_argument('--dataset_name', type=str, default='SECOND', choices=['SECOND', 'LandsatSCD'])
+    parser.add_argument('--model_type', type=str, default='convnextv2_tiny', 
+                        choices=['convnextv2_tiny', 'convnextv2_small', 'convnextv2_base', 'convnextv2_large'])
+    parser.add_argument('--weights', type=str, default=None)
+    parser.add_argument('--batch_size', type=int, default=8) # Default increased to 8 for 2x GPUs
+    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--lr', type=float, default=0.0003)
+    parser.add_argument('--save_dir', type=str, default='/kaggle/working/checkpoints')
+    parser.add_argument('--seed', type=int, default=42)
+    return parser.parse_args()
 
-    def forward(self, t1, t2):
-        img_size = t1.shape[2:]
+def train(args):
+    set_seed(args.seed)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    os.makedirs(args.save_dir, exist_ok=True)
+
+    print("\n" + "="*50)
+    print("TRAINING CONFIGURATION:")
+    for arg, value in vars(args).items():
+        print(f"  --{arg}: {value}")
+    print("="*50 + "\n")
+
+    num_classes = 7 if args.dataset_name.upper() == 'SECOND' else 5
+    
+    print(f"Initializing BoundNeXt (Num Classes: {num_classes}, Backbone: {args.model_type})...")
+    model = BoundNeXt(
+        num_classes=num_classes, 
+        pretrained_path=args.weights, 
+        model_type=args.model_type    
+    )
+    
+    # =================================================================
+    # [NEW] MULTI-GPU SUPPORT (DataParallel)
+    # =================================================================
+    if torch.cuda.device_count() > 1:
+        print(f"🔥 Let's use {torch.cuda.device_count()} GPUs!")
+        model = nn.DataParallel(model)
         
-        # --- Encoding with Temporal Interaction (TDTI) ---
-        f1_list, f2_list = self.encoder(t1, t2)
+    model = model.to(device)
+    # =================================================================
+    
+    criterion = BoundMambaLoss().to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    
+    scaler = GradScaler('cuda', enabled=torch.cuda.is_available())
+    metrics = SCDMetrics(num_classes=num_classes)
+
+    print(f"Loading {args.dataset_name} dataset with 512x512 resolution...")
+    train_set = SCDDataset(root=args.data_root, mode='train', dataset_name=args.dataset_name, patch_mode=False)
+    val_set = SCDDataset(root=args.data_root, mode='val', dataset_name=args.dataset_name, patch_mode=False)
+    
+    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=0, pin_memory=True)
+    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, num_workers=0, pin_memory=True)
+
+    print(f"Train samples: {len(train_set)} | Val samples: {len(val_set)}")
+
+    best_score = 0.0
+
+    for epoch in range(args.epochs):
+        model.train()
+        epoch_loss = 0
         
-        # --- Boundary Task ---
-        diff_low = torch.abs(f1_list[0] - f2_list[0])
-        boundary_logits = self.boundary_head(diff_low)
-        boundary_map = torch.sigmoid(boundary_logits)
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
+        for batch in pbar:
+            t1 = batch['img_A'].to(device)
+            t2 = batch['img_B'].to(device)
+            l1 = batch['sem1'].to(device)
+            l2 = batch['sem2'].to(device)
+            gt_cd = batch['bcd'].to(device) 
+            
+            gt_bd = extract_boundary(gt_cd).to(device)
+            
+            optimizer.zero_grad()
+            
+            with autocast('cuda', enabled=torch.cuda.is_available()):
+                pred_ss1, pred_ss2, pred_cd, pred_bd = model(t1, t2)
+                loss, loss_dict = criterion((pred_ss1, pred_ss2, pred_cd, pred_bd), (l1, l2, gt_cd, gt_bd))
+            
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            
+            epoch_loss += loss.item()
+            pbar.set_postfix({"Loss": f"{loss.item():.4f}", "CD_Loss": f"{loss_dict['cd']:.4f}"})
+            
+        scheduler.step()
         
-        # --- Bottleneck ---
-        f1_3, f2_3 = self.sc_up(f1_list[3], f2_list[3])
-        cd_3 = torch.abs(f1_3 - f2_3)
+        score = validate(model, val_loader, metrics, device, epoch)
         
-        # --- Stage 3 (s32 -> s16) ---
-        x1 = self.dec_ss1_3(f1_3, f1_list[2])
-        x2 = self.dec_ss2_3(f2_3, f2_list[2])
+        # =================================================================
+        # [NEW] MULTI-GPU SAFE CHECKPOINT SAVING
+        # DataParallel wraps the model in a `.module` attribute. We must 
+        # save `model.module.state_dict()` so we can easily load it later 
+        # on a single GPU if needed.
+        # =================================================================
+        model_to_save = model.module if hasattr(model, 'module') else model
         
-        cd_x = self.dec_cd_3(cd_3)
-        cd_x = self.bgi_3(x1, x2, cd_x, boundary_map) 
+        if score > best_score:
+            best_score = score
+            save_path = os.path.join(args.save_dir, f'boundnext_{args.model_type}_best.pth')
+            torch.save(model_to_save.state_dict(), save_path)
+            print(f"New Best Score: {best_score:.4f} (Saved to {save_path})")
         
-        # --- Stage 2 (s16 -> s8) ---
-        x1 = self.dec_ss1_2(x1, f1_list[1])
-        x2 = self.dec_ss2_2(x2, f2_list[1])
-        
-        cd_x = self.dec_cd_2(cd_x)
-        cd_x = self.bgi_2(x1, x2, cd_x, boundary_map) 
-        
-        # --- Stage 1 (s8 -> s4) ---
-        x1 = self.dec_ss1_1(x1, f1_list[0])
-        x2 = self.dec_ss2_1(x2, f2_list[0])
-        
-        cd_x = self.dec_cd_1(cd_x)
-        cd_x = self.bgi_1(x1, x2, cd_x, boundary_map) 
-        
-        # --- Heads ---
-        out_ss1, out_ss2, out_cd = self.head(x1, x2, cd_x)
-        
-        out_ss1 = F.interpolate(out_ss1, size=img_size, mode='bilinear')
-        out_ss2 = F.interpolate(out_ss2, size=img_size, mode='bilinear')
-        out_cd = F.interpolate(out_cd, size=img_size, mode='bilinear')
-        out_bd = F.interpolate(boundary_logits, size=img_size, mode='bilinear')
-        
-        return out_ss1, out_ss2, out_cd, out_bd
+        torch.save(model_to_save.state_dict(), os.path.join(args.save_dir, f'boundnext_{args.model_type}_last.pth'))
+
+def validate(model, loader, metrics, device, epoch):
+    model.eval()
+    metrics.reset()
+    
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="Validating"):
+            t1 = batch['img_A'].to(device)
+            t2 = batch['img_B'].to(device)
+            l1 = batch['sem1'].to(device)
+            l2 = batch['sem2'].to(device)
+            gt_cd = batch['bcd'].to(device)
+            
+            with autocast('cuda', enabled=torch.cuda.is_available()):
+                pred_ss1, pred_ss2, pred_cd, _ = model(t1, t2)
+            
+            p_ss1 = torch.argmax(pred_ss1, dim=1)
+            p_ss2 = torch.argmax(pred_ss2, dim=1)
+            p_cd = (torch.sigmoid(pred_cd) > 0.5).long().squeeze(1)
+            
+            metrics.update(p_ss1, p_ss2, p_cd, l1, l2, gt_cd)
+            
+    results = metrics.compute()
+    print(f"\n[Validation Epoch {epoch+1}]")
+    print(f"SeK: {results['sek']:.4f} | F1_BCD: {results['f1_bcd']:.4f} | mIoU: {results['miou']:.4f} | Score: {results['score']:.4f}")
+    
+    return results['score']
+
+if __name__ == '__main__':
+    args = parse_args()
+    train(args)
