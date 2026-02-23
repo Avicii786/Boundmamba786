@@ -55,10 +55,8 @@ class TriDimensionalInteraction(nn.Module):
         
         # 2. Attentions
         att_c = self.channel_gate(diff) 
-        
         diff_h = diff.mean(dim=3, keepdim=True)
         att_h = self.height_gate(diff_h)
-        
         diff_w = diff.mean(dim=2, keepdim=True)
         att_w = self.width_gate(diff_w)
         
@@ -80,17 +78,25 @@ class SiameseConvNeXtV2(nn.Module):
         
         print(f"[Backbone] Initializing {model_type} with TDTI Interaction...")
         
-        os.environ["HF_HUB_OFFLINE"] = "1" 
-        self.base_model = timm.create_model(
-            model_type, 
-            pretrained=False, 
-            in_chans=in_chans, 
-            features_only=False, 
-            num_classes=0,
-            drop_path_rate=drop_path_rate
-        )
+        # Determine whether to download automatically or use local weights
+        download_pretrained = True if checkpoint_path is None else False
+        if download_pretrained:
+            print("[Backbone] No local weights provided. Will attempt to download from TIMM/HuggingFace Hub...")
 
-        # Loading Logic
+        try:
+            self.base_model = timm.create_model(
+                model_type, 
+                pretrained=download_pretrained,  # Automatically downloads if True
+                in_chans=in_chans, 
+                features_only=False, 
+                num_classes=0,
+                drop_path_rate=drop_path_rate
+            )
+        except Exception as e:
+            print(f"[Backbone] Error creating model. Check internet connection or model_type name. Error: {e}")
+            raise e
+
+        # Local Loading Logic (Only triggers if a path is explicitly provided)
         if checkpoint_path and os.path.isfile(checkpoint_path):
             print(f"[Backbone] Loading local weights from {checkpoint_path}")
             try:
@@ -103,12 +109,13 @@ class SiameseConvNeXtV2(nn.Module):
                     state_dict = state_dict['model']
                 
                 missing, unexpected = self.base_model.load_state_dict(state_dict, strict=False)
-                print(f"[Backbone] Weights loaded successfully. Missing Keys: {len(missing)}")
+                print(f"[Backbone] Local weights loaded successfully. Missing Keys: {len(missing)}")
             except Exception as e:
-                print(f"[Backbone] Error loading weights: {e}")
+                print(f"[Backbone] Error loading local weights: {e}")
         
-        # Set dimensions based on ConvNeXt architecture
-        if 'tiny' in model_type: 
+        # Set dimensions based on ConvNeXt architecture variants
+        # Tiny and Small share the same channel dimensions, Base is wider
+        if 'tiny' in model_type or 'small' in model_type: 
             self.dims = [96, 192, 384, 768]
         elif 'base' in model_type:
             self.dims = [128, 256, 512, 1024]
@@ -122,13 +129,12 @@ class SiameseConvNeXtV2(nn.Module):
         self.stem = self.base_model.stem
         self.stages = self.base_model.stages
         
-        # [NOVELTY] Insert Tri-Dimensional Interaction after each stage
+        # Insert Tri-Dimensional Interaction after each stage
         self.interactions = nn.ModuleList([
             TriDimensionalInteraction(dim) for dim in self.dims
         ])
 
     def forward(self, x1, x2):
-        # Stem Extraction
         f1 = self.stem(x1)
         f2 = self.stem(x2)
         
@@ -136,11 +142,10 @@ class SiameseConvNeXtV2(nn.Module):
         features_2 = []
         
         for i, stage in enumerate(self.stages):
-            # A. Independent Feature Extraction
             f1 = stage(f1)
             f2 = stage(f2)
             
-            # B. [NOVELTY] TDTI Interaction
+            # TDTI Interaction
             f1, f2 = self.interactions[i](f1, f2)
             
             features_1.append(f1)
