@@ -36,14 +36,10 @@ class BoundNeXtLightning(pl.LightningModule):
     def forward(self, t1, t2):
         return self.model(t1, t2)
 
-    # =====================================================================
-    # [NEW] BACKBONE FREEZING LOGIC
-    # =====================================================================
     def on_train_epoch_start(self):
         freeze_epochs = self.args.freeze_epochs
         if freeze_epochs > 0:
             if self.current_epoch < freeze_epochs:
-                # Freeze only the pre-trained timm modules (stem and stages)
                 if self.current_epoch == 0 and self.trainer.is_global_zero:
                     print(f"\n❄️  [Warm-up] Freezing ConvNeXtV2 backbone for the first {freeze_epochs} epochs...")
                 
@@ -53,7 +49,6 @@ class BoundNeXtLightning(pl.LightningModule):
                     param.requires_grad = False
                     
             elif self.current_epoch == freeze_epochs:
-                # Unfreeze the backbone for end-to-end fine-tuning
                 if self.trainer.is_global_zero:
                     print(f"\n🔥 [Fine-Tuning] Unfreezing ConvNeXtV2 backbone for end-to-end training!")
                 
@@ -75,11 +70,28 @@ class BoundNeXtLightning(pl.LightningModule):
             (l1, l2, gt_cd, gt_bd)
         )
         
-        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=self.args.batch_size)
-        self.log('sem_loss', loss_dict['ss'], on_step=True, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=self.args.batch_size)
-        self.log('bcd_loss', loss_dict['cd'], on_step=True, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=self.args.batch_size)
+        # Logging with on_epoch=True appends "_epoch" to the keys for end-of-epoch retrieval
+        self.log('train_loss', loss, on_step=True, on_epoch=True, sync_dist=True, batch_size=self.args.batch_size)
+        self.log('sem_loss', loss_dict['ss'], on_step=True, on_epoch=True, sync_dist=True, batch_size=self.args.batch_size)
+        self.log('bcd_loss', loss_dict['cd'], on_step=True, on_epoch=True, sync_dist=True, batch_size=self.args.batch_size)
         
         return loss
+
+    # =====================================================================
+    # [NEW] CLEAN TRAINING LOG OUTPUT
+    # =====================================================================
+    def on_train_epoch_end(self):
+        if self.trainer.is_global_zero:
+            # Helper safely extracts values whether they are tensors or floats
+            def get_val(key):
+                val = self.trainer.callback_metrics.get(key, 0.0)
+                return val.item() if isinstance(val, torch.Tensor) else val
+            
+            t_loss = get_val('train_loss_epoch')
+            s_loss = get_val('sem_loss_epoch')
+            c_loss = get_val('bcd_loss_epoch')
+            
+            print(f"\n[Train Epoch {self.current_epoch}] Total Loss: {t_loss:.4f} | SEM Loss: {s_loss:.4f} | BCD Loss: {c_loss:.4f}")
 
     def validation_step(self, batch, batch_idx):
         t1, t2 = batch['img_A'], batch['img_B']
@@ -93,7 +105,7 @@ class BoundNeXtLightning(pl.LightningModule):
             (l1, l2, gt_cd, gt_bd)
         )
         
-        self.log('val_loss', loss, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=self.args.batch_size)
+        self.log('val_loss', loss, on_epoch=True, sync_dist=True, batch_size=self.args.batch_size)
         
         p_ss1 = torch.argmax(pred_ss1, dim=1)
         p_ss2 = torch.argmax(pred_ss2, dim=1)
@@ -116,21 +128,21 @@ class BoundNeXtLightning(pl.LightningModule):
         self.metrics.hist_bcd = hist_bcd_t.cpu().numpy()
         
         res = self.metrics.compute()
+        
         val_loss = self.trainer.callback_metrics.get('val_loss', torch.tensor(0.0))
         val_loss_val = val_loss.item() if isinstance(val_loss, torch.Tensor) else val_loss
         
+        # Clean Output for Validation
         if self.trainer.is_global_zero:
-            print(f"\n[Validation Epoch {self.current_epoch}]")
-            print(f"Val Loss: {val_loss_val:.4f} | SeK: {res['sek']:.4f} | F1_BCD: {res['f1_bcd']:.4f} | mIoU: {res['miou']:.4f} | Score: {res['score']:.4f}")
+            print(f"[Valid Epoch {self.current_epoch}] Val Loss: {val_loss_val:.4f} | SeK: {res['sek']:.4f} | F1_BCD: {res['f1_bcd']:.4f} | mIoU: {res['miou']:.4f} | Score: {res['score']:.4f}")
+            print("-" * 75)
         
-        # sync_dist=False, rank_zero_only=True completely removes the syncing warnings!
         self.log('val_score', res['score'], sync_dist=False, rank_zero_only=True)
         self.log('val_miou', res['miou'], sync_dist=False, rank_zero_only=True)
         
         self.metrics.reset()
 
     def configure_optimizers(self):
-        # We pass all parameters to AdamW. It safely ignores gradients for frozen layers.
         optimizer = optim.AdamW(self.parameters(), lr=self.args.lr, weight_decay=1e-4)
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.args.epochs)
         return [optimizer], [scheduler]
@@ -143,10 +155,7 @@ def parse_args():
     parser.add_argument('--weights', type=str, default=None)
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--epochs', type=int, default=100)
-    
-    # [NEW] Control how many epochs the backbone stays frozen
     parser.add_argument('--freeze_epochs', type=int, default=5, help='Number of epochs to freeze pretrained backbone')
-    
     parser.add_argument('--lr', type=float, default=0.0003)
     parser.add_argument('--save_dir', type=str, default='/kaggle/working/checkpoints')
     parser.add_argument('--seed', type=int, default=42)
@@ -183,9 +192,12 @@ def main():
         max_epochs=args.epochs,
         precision="16-mixed",            
         callbacks=[checkpoint_callback, lr_monitor],
-        log_every_n_steps=10,
-        enable_progress_bar=True
+        enable_progress_bar=False,  # <--- [FIX] Disables the spammy TQDM bar for background runs!
+        logger=False                # Optionally set to True if you want to use Tensorboard
     )
+
+    if trainer.is_global_zero:
+        print("\n🚀 Training Starting... (Progress bar disabled for clean Kaggle background logs)\n")
 
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
