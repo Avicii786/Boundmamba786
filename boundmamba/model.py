@@ -26,29 +26,24 @@ class DecoderBlock(nn.Module):
         return self.conv(x)
 
 class BoundNeXt(nn.Module):
-    def __init__(self, num_classes=7, pretrained_path=None, model_type='convnextv2_tiny'):
+    def __init__(self, num_classes=7, pretrained_path=None, model_type='convnextv2_base'):
         super().__init__()
         
-        # 1. Siamese ConvNeXtV2 with TDTI Encoder
         self.encoder = SiameseConvNeXtV2(
             model_type=model_type,
             checkpoint_path=pretrained_path,
-            drop_path_rate=0.2
+            drop_path_rate=0.3 # Increased drop_path for base model regularization
         )
-        dims = self.encoder.dims # Automatically adjusts based on tiny/small/base
+        dims = self.encoder.dims 
         
-        # 2. Bottleneck (SC-UP)
         self.sc_up = SC_UP_Module(dims[3])
         
-        # 3. Boundary Branch (Auxiliary)
         self.boundary_head = nn.Sequential(
             nn.Conv2d(dims[0], 64, 3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
+            nn.BatchNorm2d(64), nn.ReLU(),
             nn.Conv2d(64, 1, 1)
         )
 
-        # 4. Decoders (3 Streams)
         self.dec_ss1_3 = DecoderBlock(dims[3], dims[2], dims[2])
         self.dec_ss1_2 = DecoderBlock(dims[2], dims[1], dims[1])
         self.dec_ss1_1 = DecoderBlock(dims[1], dims[0], dims[0])
@@ -61,51 +56,39 @@ class BoundNeXt(nn.Module):
         self.dec_cd_2 = DecoderBlock(dims[2], 0, dims[1])
         self.dec_cd_1 = DecoderBlock(dims[1], 0, dims[0])
         
-        # 5. Task Interaction Modules (BGI)
         self.bgi_3 = BGI_Module(dims[2])
         self.bgi_2 = BGI_Module(dims[1])
         self.bgi_1 = BGI_Module(dims[0])
         
-        # 6. Final Head
         self.head = UWFF_Head(dims[0], num_classes)
 
     def forward(self, t1, t2):
         img_size = t1.shape[2:]
         
-        # --- Encoding with Temporal Interaction (TDTI) ---
         f1_list, f2_list = self.encoder(t1, t2)
         
-        # --- Boundary Task ---
         diff_low = torch.abs(f1_list[0] - f2_list[0])
         boundary_logits = self.boundary_head(diff_low)
         boundary_map = torch.sigmoid(boundary_logits)
         
-        # --- Bottleneck ---
         f1_3, f2_3 = self.sc_up(f1_list[3], f2_list[3])
         cd_3 = torch.abs(f1_3 - f2_3)
         
-        # --- Stage 3 (s32 -> s16) ---
         x1 = self.dec_ss1_3(f1_3, f1_list[2])
         x2 = self.dec_ss2_3(f2_3, f2_list[2])
-        
         cd_x = self.dec_cd_3(cd_3)
         cd_x = self.bgi_3(x1, x2, cd_x, boundary_map) 
         
-        # --- Stage 2 (s16 -> s8) ---
         x1 = self.dec_ss1_2(x1, f1_list[1])
         x2 = self.dec_ss2_2(x2, f2_list[1])
-        
         cd_x = self.dec_cd_2(cd_x)
         cd_x = self.bgi_2(x1, x2, cd_x, boundary_map) 
         
-        # --- Stage 1 (s8 -> s4) ---
         x1 = self.dec_ss1_1(x1, f1_list[0])
         x2 = self.dec_ss2_1(x2, f2_list[0])
-        
         cd_x = self.dec_cd_1(cd_x)
         cd_x = self.bgi_1(x1, x2, cd_x, boundary_map) 
         
-        # --- Heads ---
         out_ss1, out_ss2, out_cd = self.head(x1, x2, cd_x)
         
         out_ss1 = F.interpolate(out_ss1, size=img_size, mode='bilinear')
@@ -113,4 +96,12 @@ class BoundNeXt(nn.Module):
         out_cd = F.interpolate(out_cd, size=img_size, mode='bilinear')
         out_bd = F.interpolate(boundary_logits, size=img_size, mode='bilinear')
         
+        # SOTA Trick: Task Alignment during Inference
+        if not self.training:
+            # If BCD predicts 0 (no change), force SS2 to match SS1's logic
+            # This mathematically guarantees no SeK pseudo-change penalty.
+            cd_mask = (torch.sigmoid(out_cd) > 0.5).float()
+            # Where cd_mask is 0 (no change), blend ss2 into ss1
+            out_ss2 = (cd_mask * out_ss2) + ((1.0 - cd_mask) * out_ss1)
+
         return out_ss1, out_ss2, out_cd, out_bd
