@@ -1,8 +1,7 @@
 import os
 import argparse
-import random
-import numpy as np
 import torch
+import numpy as np
 import torch.optim as optim
 from torch.utils.data import DataLoader
 import warnings
@@ -27,7 +26,6 @@ class BoundNeXtLightning(pl.LightningModule):
         self.save_hyperparameters()
         self.args = args
         
-        # Initialize Architecture
         num_classes = 7 if args.dataset_name.upper() == 'SECOND' else 5
         self.model = BoundNeXt(
             num_classes=num_classes, 
@@ -47,13 +45,28 @@ class BoundNeXtLightning(pl.LightningModule):
             print(f"{'Epoch':^7} | {'T-Loss':^8} | {'S-Loss':^8} | {'B-Loss':^8} | {'V-Loss':^8} | {'SeK':^7} | {'F1-BCD':^7} | {'Score':^7}")
             print("-" * 110)
 
+    # =================================================================
+    # FREEZING / UNFREEZING LOGIC
+    # =================================================================
     def on_train_epoch_start(self):
-        # Backbone Freezing Logic
         freeze_epochs = self.args.freeze_epochs
         if freeze_epochs > 0:
             should_freeze = self.current_epoch < freeze_epochs
-            for param in self.model.encoder.stem.parameters(): param.requires_grad = not should_freeze
-            for param in self.model.encoder.stages.parameters(): param.requires_grad = not should_freeze
+            
+            # Apply to stem and stages (Leave custom interactions unfrozen)
+            for param in self.model.encoder.stem.parameters(): 
+                param.requires_grad = not should_freeze
+            for param in self.model.encoder.stages.parameters(): 
+                param.requires_grad = not should_freeze
+            
+            # Print warm-up / unfreeze status cleanly
+            if self.current_epoch == 0 and self.trainer.is_global_zero:
+                print(f"❄️  [Warm-up] Freezing ConvNeXtV2 backbone for {freeze_epochs} epochs...\n")
+            elif self.current_epoch == freeze_epochs and self.trainer.is_global_zero:
+                print(f"\n🔥 [Fine-Tuning] Unfreezing backbone for end-to-end training!")
+                print("-" * 110)
+                print(f"{'Epoch':^7} | {'T-Loss':^8} | {'S-Loss':^8} | {'B-Loss':^8} | {'V-Loss':^8} | {'SeK':^7} | {'F1-BCD':^7} | {'Score':^7}")
+                print("-" * 110)
 
     def training_step(self, batch, batch_idx):
         t1, t2, l1, l2, gt_cd = batch['img_A'], batch['img_B'], batch['sem1'], batch['sem2'], batch['bcd']
@@ -66,10 +79,6 @@ class BoundNeXtLightning(pl.LightningModule):
         self.log('s_loss', loss_dict['ss'], on_step=False, on_epoch=True, sync_dist=True)
         self.log('b_loss', loss_dict['cd'], on_step=False, on_epoch=True, sync_dist=True)
         
-        # Heartbeat
-        if batch_idx % 100 == 0 and self.trainer.is_global_zero:
-            print(".", end="", flush=True)
-            
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -85,39 +94,34 @@ class BoundNeXtLightning(pl.LightningModule):
         self.metrics.update(p_ss1, p_ss2, p_cd, l1, l2, gt_cd)
 
     def on_validation_epoch_end(self):
-        # [FIXED BUG]: Safe DDP Aggregation using all_gather instead of strategy.reduce
-        h1_t = torch.tensor(self.metrics.hist_sem1, device=self.device)
-        h2_t = torch.tensor(self.metrics.hist_sem2, device=self.device)
-        hb_t = torch.tensor(self.metrics.hist_bcd, device=self.device)
+        device = self.device
+        h1_t = torch.tensor(self.metrics.hist_sem1, device=device)
+        h2_t = torch.tensor(self.metrics.hist_sem2, device=device)
+        hb_t = torch.tensor(self.metrics.hist_bcd, device=device)
 
-        # Gather from all GPUs safely
         h1_g = self.all_gather(h1_t)
         h2_g = self.all_gather(h2_t)
         hb_g = self.all_gather(hb_t)
 
-        # all_gather returns shape [num_gpus, classes, classes], so we sum along dim 0
         if h1_g.dim() > h1_t.dim():
             h1_t, h2_t, hb_t = h1_g.sum(dim=0), h2_g.sum(dim=0), hb_g.sum(dim=0)
-        else:
-            h1_t, h2_t, hb_t = h1_g, h2_g, hb_g
 
-        # Overwrite internal numpy matrices with synchronized totals
         self.metrics.hist_sem1 = h1_t.cpu().numpy()
         self.metrics.hist_sem2 = h2_t.cpu().numpy()
         self.metrics.hist_bcd = hb_t.cpu().numpy()
         
-        res = self.metrics.compute()
-        self.log('val_score', res['score'], sync_dist=False, rank_zero_only=True)
-        
-        # Table Row Printing (Ignore sanity check outputs to keep table clean)
-        if self.trainer.is_global_zero and not self.trainer.sanity_checking:
+        self.last_val_metrics = self.metrics.compute()
+        self.log('val_score', self.last_val_metrics['score'], sync_dist=False, rank_zero_only=True)
+        self.metrics.reset()
+
+    def on_train_epoch_end(self):
+        if self.trainer.is_global_zero and hasattr(self, 'last_val_metrics'):
             def gv(k): 
                 v = self.trainer.callback_metrics.get(k, torch.tensor(0.0))
                 return v.item() if isinstance(v, torch.Tensor) else v
 
-            print(f"\r{self.current_epoch:^7} | {gv('t_loss'):^8.4f} | {gv('s_loss'):^8.4f} | {gv('b_loss'):^8.4f} | {gv('val_loss'):^8.4f} | {res['sek']:^7.4f} | {res['f1_bcd']:^7.4f} | {res['score']:^7.4f}")
-        
-        self.metrics.reset()
+            res = self.last_val_metrics
+            print(f" {self.current_epoch:^7} | {gv('t_loss'):^8.4f} | {gv('s_loss'):^8.4f} | {gv('b_loss'):^8.4f} | {gv('val_loss'):^8.4f} | {res['sek']:^7.4f} | {res['f1_bcd']:^7.4f} | {res['score']:^7.4f}")
 
     def configure_optimizers(self):
         optimizer = optim.AdamW(self.parameters(), lr=self.args.lr, weight_decay=0.05)
