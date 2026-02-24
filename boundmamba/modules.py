@@ -2,110 +2,95 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# ==============================================================================
-# 1. SC_UP: Semantic Correlation & Unchanged-Prior Module
-# ==============================================================================
-class SC_UP_Module(nn.Module):
-    def __init__(self, in_dim):
+class ASPP(nn.Module):
+    """ Atrous Spatial Pyramid Pooling for Global Context """
+    def __init__(self, in_channels, out_channels):
         super().__init__()
-        # Calculate Similarity Map
-        self.sim_conv = nn.Sequential(
-            nn.Conv2d(in_dim * 2, in_dim // 2, 1),
-            nn.BatchNorm2d(in_dim // 2),
-            nn.ReLU(),
-            nn.Conv2d(in_dim // 2, 1, 1),
-            nn.Sigmoid()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 1, bias=False)
+        self.conv2 = nn.Conv2d(in_channels, out_channels, 3, padding=6, dilation=6, bias=False)
+        self.conv3 = nn.Conv2d(in_channels, out_channels, 3, padding=12, dilation=12, bias=False)
+        self.conv4 = nn.Conv2d(in_channels, out_channels, 3, padding=18, dilation=18, bias=False)
+        self.global_avg_pool = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Conv2d(in_channels, out_channels, 1, bias=False)
         )
-        self.proj = nn.Conv2d(in_dim, in_dim, 1)
+        self.out_conv = nn.Sequential(
+            nn.Conv2d(out_channels * 5, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.1)
+        )
+
+    def forward(self, x):
+        x1 = self.conv1(x)
+        x2 = self.conv2(x)
+        x3 = self.conv3(x)
+        x4 = self.conv4(x)
+        x5 = self.global_avg_pool(x)
+        x5 = F.interpolate(x5, size=x.shape[2:], mode='bilinear', align_corners=False)
+        x_concat = torch.cat([x1, x2, x3, x4, x5], dim=1)
+        return self.out_conv(x_concat)
+
+class SC_UP_Module(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        mid_ch = in_channels // 2
+        # SOTA Update: Inject ASPP for multi-scale context
+        self.aspp1 = ASPP(in_channels, mid_ch)
+        self.aspp2 = ASPP(in_channels, mid_ch)
+        
+        self.corr_conv = nn.Sequential(
+            nn.Conv2d(mid_ch * 2, mid_ch, 3, padding=1),
+            nn.BatchNorm2d(mid_ch),
+            nn.ReLU(inplace=True)
+        )
+        self.proj1 = nn.Conv2d(mid_ch, in_channels, 1)
+        self.proj2 = nn.Conv2d(mid_ch, in_channels, 1)
 
     def forward(self, f1, f2):
-        sim_map = self.sim_conv(torch.cat([f1, f2], dim=1))
-        # Unchanged Prior: High similarity -> Low weight
-        change_attn = 1.0 - sim_map
+        # Extract global context
+        f1_ctx = self.aspp1(f1)
+        f2_ctx = self.aspp2(f2)
         
-        f1_refined = f1 * change_attn + self.proj(f1)
-        f2_refined = f2 * change_attn + self.proj(f2)
+        # Correlation
+        concat = torch.cat([f1_ctx, f2_ctx], dim=1)
+        corr = self.corr_conv(concat)
         
-        return f1_refined, f2_refined
+        # Unchanged Prior Suppression
+        f1_out = f1 + self.proj1(f1_ctx * corr)
+        f2_out = f2 + self.proj2(f2_ctx * corr)
+        
+        return f1_out, f2_out
 
-# ==============================================================================
-# 2. BGI: Boundary-Gated Interaction Module (Your Core Innovation)
-# ==============================================================================
 class BGI_Module(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, in_channels):
         super().__init__()
-        self.diff_conv = nn.Sequential(
-            nn.Conv2d(dim, dim, 3, padding=1, groups=dim), # Depthwise
-            nn.BatchNorm2d(dim),
-            nn.Conv2d(dim, dim, 1),
-            nn.BatchNorm2d(dim),
-            nn.ReLU()
-        )
-        self.gate_conv = nn.Sequential(
+        self.spatial_gate = nn.Sequential(
             nn.Conv2d(1, 16, 3, padding=1),
-            nn.ReLU(),
+            nn.BatchNorm2d(16), nn.ReLU(),
             nn.Conv2d(16, 1, 1),
             nn.Sigmoid()
         )
+        self.fusion = nn.Sequential(
+            nn.Conv2d(in_channels * 3, in_channels, 3, padding=1),
+            nn.BatchNorm2d(in_channels), nn.ReLU()
+        )
 
-    def forward(self, f_ss1, f_ss2, f_cd, boundary_map):
-        sem_diff = f_ss1 - f_ss2
+    def forward(self, x1, x2, cd, bd_map):
+        if bd_map.shape[2:] != cd.shape[2:]:
+            bd_map = F.interpolate(bd_map, size=cd.shape[2:], mode='bilinear')
         
-        # Resize boundary map if needed
-        if boundary_map.shape[2:] != f_cd.shape[2:]:
-            b_map = F.interpolate(boundary_map, size=f_cd.shape[2:], mode='bilinear')
-        else:
-            b_map = boundary_map
-            
-        gate = self.gate_conv(b_map)
+        gate = self.spatial_gate(bd_map)
+        cd_sharpened = cd * (1 + gate)
         
-        # Inject semantic difference, amplified by boundary presence
-        injection = self.diff_conv(sem_diff) * (1 + gate)
-        
-        return f_cd + injection
+        return self.fusion(torch.cat([x1, x2, cd_sharpened], dim=1))
 
-# ==============================================================================
-# 3. UWFF: Uncertainty-Weighted Feature Fusion Head
-# ==============================================================================
 class UWFF_Head(nn.Module):
-    def __init__(self, in_dim, num_classes_ss=7):
+    def __init__(self, in_channels, num_classes):
         super().__init__()
-        self.ss1_head = nn.Sequential(
-            nn.Conv2d(in_dim, in_dim // 2, 3, padding=1),
-            nn.BatchNorm2d(in_dim // 2),
-            nn.ReLU(),
-            nn.Conv2d(in_dim // 2, num_classes_ss, 1)
-        )
-        self.ss2_head = nn.Sequential(
-            nn.Conv2d(in_dim, in_dim // 2, 3, padding=1),
-            nn.BatchNorm2d(in_dim // 2),
-            nn.ReLU(),
-            nn.Conv2d(in_dim // 2, num_classes_ss, 1)
-        )
-        self.cd_head = nn.Sequential(
-            nn.Conv2d(in_dim, in_dim // 2, 3, padding=1),
-            nn.BatchNorm2d(in_dim // 2),
-            nn.ReLU(),
-            nn.Conv2d(in_dim // 2, 1, 1)
-        )
-        
-    def get_entropy(self, logits):
-        p = torch.softmax(logits, dim=1)
-        log_p = F.log_softmax(logits, dim=1)
-        entropy = -torch.sum(p * log_p, dim=1, keepdim=True)
-        return entropy / torch.log(torch.tensor(logits.shape[1], dtype=torch.float, device=logits.device))
+        self.ss1_head = nn.Conv2d(in_channels, num_classes, 1)
+        self.ss2_head = nn.Conv2d(in_channels, num_classes, 1)
+        self.cd_head = nn.Conv2d(in_channels, 1, 1)
 
-    def forward(self, x_ss1, x_ss2, x_cd):
-        logit_ss1 = self.ss1_head(x_ss1)
-        logit_ss2 = self.ss2_head(x_ss2)
-        logit_cd = self.cd_head(x_cd)
-        
-        # Detach entropy to avoid gradient issues
-        h1 = self.get_entropy(logit_ss1).detach()
-        h2 = self.get_entropy(logit_ss2).detach()
-        avg_h = (h1 + h2) / 2.0
-        
-        # Fusion: Trust raw CD more when SS is uncertain
-        final_cd = logit_cd * (1 + avg_h)
-        
-        return logit_ss1, logit_ss2, final_cd
+    def forward(self, x1, x2, cd_f):
+        return self.ss1_head(x1), self.ss2_head(x2), self.cd_head(cd_f)
