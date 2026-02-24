@@ -62,7 +62,6 @@ class BoundNeXtLightning(pl.LightningModule):
         pred_ss1, pred_ss2, pred_cd, pred_bd = self(t1, t2)
         loss, loss_dict = self.criterion((pred_ss1, pred_ss2, pred_cd, pred_bd), (l1, l2, gt_cd, gt_bd))
         
-        # Log for table retrieval at end of epoch
         self.log('t_loss', loss, on_step=False, on_epoch=True, sync_dist=True)
         self.log('s_loss', loss_dict['ss'], on_step=False, on_epoch=True, sync_dist=True)
         self.log('b_loss', loss_dict['cd'], on_step=False, on_epoch=True, sync_dist=True)
@@ -75,14 +74,10 @@ class BoundNeXtLightning(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         t1, t2, l1, l2, gt_cd = batch['img_A'], batch['img_B'], batch['sem1'], batch['sem2'], batch['bcd']
-        
-        # [FIXED BUG]: Properly extract gt_bd and capture pred_bd from the model
         gt_bd = extract_boundary(gt_cd)
         pred_ss1, pred_ss2, pred_cd, pred_bd = self(t1, t2)
         
-        # Pass 4D pred_bd and 3D gt_bd into criterion correctly
         loss, _ = self.criterion((pred_ss1, pred_ss2, pred_cd, pred_bd), (l1, l2, gt_cd, gt_bd))
-        
         self.log('val_loss', loss, on_epoch=True, sync_dist=True)
         
         p_ss1, p_ss2 = torch.argmax(pred_ss1, dim=1), torch.argmax(pred_ss2, dim=1)
@@ -90,23 +85,34 @@ class BoundNeXtLightning(pl.LightningModule):
         self.metrics.update(p_ss1, p_ss2, p_cd, l1, l2, gt_cd)
 
     def on_validation_epoch_end(self):
-        # DDP Sync
-        device = self.device
-        h1 = self.trainer.strategy.reduce(torch.tensor(self.metrics.hist_sem1, device=device), "sum")
-        h2 = self.trainer.strategy.reduce(torch.tensor(self.metrics.hist_sem2, device=device), "sum")
-        hb = self.trainer.strategy.reduce(torch.tensor(self.metrics.hist_bcd, device=device), "sum")
-        self.metrics.hist_sem1, self.metrics.hist_sem2, self.metrics.hist_bcd = h1.cpu().numpy(), h2.cpu().numpy(), hb.cpu().numpy()
+        # [FIXED BUG]: Safe DDP Aggregation using all_gather instead of strategy.reduce
+        h1_t = torch.tensor(self.metrics.hist_sem1, device=self.device)
+        h2_t = torch.tensor(self.metrics.hist_sem2, device=self.device)
+        hb_t = torch.tensor(self.metrics.hist_bcd, device=self.device)
+
+        # Gather from all GPUs safely
+        h1_g = self.all_gather(h1_t)
+        h2_g = self.all_gather(h2_t)
+        hb_g = self.all_gather(hb_t)
+
+        # all_gather returns shape [num_gpus, classes, classes], so we sum along dim 0
+        if h1_g.dim() > h1_t.dim():
+            h1_t, h2_t, hb_t = h1_g.sum(dim=0), h2_g.sum(dim=0), hb_g.sum(dim=0)
+        else:
+            h1_t, h2_t, hb_t = h1_g, h2_g, hb_g
+
+        # Overwrite internal numpy matrices with synchronized totals
+        self.metrics.hist_sem1 = h1_t.cpu().numpy()
+        self.metrics.hist_sem2 = h2_t.cpu().numpy()
+        self.metrics.hist_bcd = hb_t.cpu().numpy()
         
         res = self.metrics.compute()
         self.log('val_score', res['score'], sync_dist=False, rank_zero_only=True)
         
-        # Table Row Printing
-        if self.trainer.is_global_zero:
-            if self.trainer.state.stage == 'sanity_check':
-                return
-            
+        # Table Row Printing (Ignore sanity check outputs to keep table clean)
+        if self.trainer.is_global_zero and not self.trainer.sanity_checking:
             def gv(k): 
-                v = self.trainer.callback_metrics.get(k, 0.0)
+                v = self.trainer.callback_metrics.get(k, torch.tensor(0.0))
                 return v.item() if isinstance(v, torch.Tensor) else v
 
             print(f"\r{self.current_epoch:^7} | {gv('t_loss'):^8.4f} | {gv('s_loss'):^8.4f} | {gv('b_loss'):^8.4f} | {gv('val_loss'):^8.4f} | {res['sek']:^7.4f} | {res['f1_bcd']:^7.4f} | {res['score']:^7.4f}")
@@ -114,9 +120,7 @@ class BoundNeXtLightning(pl.LightningModule):
         self.metrics.reset()
 
     def configure_optimizers(self):
-        # SOTA Adjustment: Lower LR, Higher Weight Decay
         optimizer = optim.AdamW(self.parameters(), lr=self.args.lr, weight_decay=0.05)
-        # Cosine Annealing with Warm Restarts
         scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=20, T_mult=2)
         return [optimizer], [scheduler]
 
