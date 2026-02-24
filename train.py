@@ -42,7 +42,8 @@ class BoundNeXtLightning(pl.LightningModule):
     def on_train_start(self):
         if self.trainer.is_global_zero:
             print("\n" + "="*110)
-            print(f"{'Epoch':^7} | {'T-Loss':^8} | {'S-Loss':^8} | {'B-Loss':^8} | {'V-Loss':^8} | {'SeK':^7} | {'F1-BCD':^7} | {'Score':^7}")
+            # [RESTORED mIoU]
+            print(f"{'Epoch':^7} | {'T-Loss':^8} | {'S-Loss':^8} | {'B-Loss':^8} | {'V-Loss':^8} | {'SeK':^7} | {'F1-BCD':^7} | {'mIoU':^7} | {'Score':^7}")
             print("-" * 110)
 
     # =================================================================
@@ -53,19 +54,18 @@ class BoundNeXtLightning(pl.LightningModule):
         if freeze_epochs > 0:
             should_freeze = self.current_epoch < freeze_epochs
             
-            # Apply to stem and stages (Leave custom interactions unfrozen)
             for param in self.model.encoder.stem.parameters(): 
                 param.requires_grad = not should_freeze
             for param in self.model.encoder.stages.parameters(): 
                 param.requires_grad = not should_freeze
             
-            # Print warm-up / unfreeze status cleanly
             if self.current_epoch == 0 and self.trainer.is_global_zero:
                 print(f"❄️  [Warm-up] Freezing ConvNeXtV2 backbone for {freeze_epochs} epochs...\n")
             elif self.current_epoch == freeze_epochs and self.trainer.is_global_zero:
                 print(f"\n🔥 [Fine-Tuning] Unfreezing backbone for end-to-end training!")
                 print("-" * 110)
-                print(f"{'Epoch':^7} | {'T-Loss':^8} | {'S-Loss':^8} | {'B-Loss':^8} | {'V-Loss':^8} | {'SeK':^7} | {'F1-BCD':^7} | {'Score':^7}")
+                # [RESTORED mIoU]
+                print(f"{'Epoch':^7} | {'T-Loss':^8} | {'S-Loss':^8} | {'B-Loss':^8} | {'V-Loss':^8} | {'SeK':^7} | {'F1-BCD':^7} | {'mIoU':^7} | {'Score':^7}")
                 print("-" * 110)
 
     def training_step(self, batch, batch_idx):
@@ -121,7 +121,8 @@ class BoundNeXtLightning(pl.LightningModule):
                 return v.item() if isinstance(v, torch.Tensor) else v
 
             res = self.last_val_metrics
-            print(f" {self.current_epoch:^7} | {gv('t_loss'):^8.4f} | {gv('s_loss'):^8.4f} | {gv('b_loss'):^8.4f} | {gv('val_loss'):^8.4f} | {res['sek']:^7.4f} | {res['f1_bcd']:^7.4f} | {res['score']:^7.4f}")
+            # [RESTORED mIoU]
+            print(f" {self.current_epoch:^7} | {gv('t_loss'):^8.4f} | {gv('s_loss'):^8.4f} | {gv('b_loss'):^8.4f} | {gv('val_loss'):^8.4f} | {res['sek']:^7.4f} | {res['f1_bcd']:^7.4f} | {res['miou']:^7.4f} | {res['score']:^7.4f}")
 
     def configure_optimizers(self):
         optimizer = optim.AdamW(self.parameters(), lr=self.args.lr, weight_decay=0.05)
