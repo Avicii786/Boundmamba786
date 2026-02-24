@@ -7,14 +7,12 @@ from torch.utils.data import DataLoader
 import warnings
 import logging
 
-# 1. Total Silence for "Garbage" Logs
 warnings.filterwarnings("ignore")
 logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
 
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
 
-# Imports from your package
 from boundmamba import BoundNeXt, BoundMambaLoss
 from boundmamba.utils import extract_boundary
 from boundmamba.metrics import SCDMetrics
@@ -42,13 +40,9 @@ class BoundNeXtLightning(pl.LightningModule):
     def on_train_start(self):
         if self.trainer.is_global_zero:
             print("\n" + "="*110)
-            # [RESTORED mIoU]
             print(f"{'Epoch':^7} | {'T-Loss':^8} | {'S-Loss':^8} | {'B-Loss':^8} | {'V-Loss':^8} | {'SeK':^7} | {'F1-BCD':^7} | {'mIoU':^7} | {'Score':^7}")
             print("-" * 110)
 
-    # =================================================================
-    # FREEZING / UNFREEZING LOGIC
-    # =================================================================
     def on_train_epoch_start(self):
         freeze_epochs = self.args.freeze_epochs
         if freeze_epochs > 0:
@@ -64,7 +58,6 @@ class BoundNeXtLightning(pl.LightningModule):
             elif self.current_epoch == freeze_epochs and self.trainer.is_global_zero:
                 print(f"\n🔥 [Fine-Tuning] Unfreezing backbone for end-to-end training!")
                 print("-" * 110)
-                # [RESTORED mIoU]
                 print(f"{'Epoch':^7} | {'T-Loss':^8} | {'S-Loss':^8} | {'B-Loss':^8} | {'V-Loss':^8} | {'SeK':^7} | {'F1-BCD':^7} | {'mIoU':^7} | {'Score':^7}")
                 print("-" * 110)
 
@@ -78,15 +71,13 @@ class BoundNeXtLightning(pl.LightningModule):
         self.log('t_loss', loss, on_step=False, on_epoch=True, sync_dist=True)
         self.log('s_loss', loss_dict['ss'], on_step=False, on_epoch=True, sync_dist=True)
         self.log('b_loss', loss_dict['cd'], on_step=False, on_epoch=True, sync_dist=True)
-        
         return loss
 
     def validation_step(self, batch, batch_idx):
         t1, t2, l1, l2, gt_cd = batch['img_A'], batch['img_B'], batch['sem1'], batch['sem2'], batch['bcd']
-        gt_bd = extract_boundary(gt_cd)
         pred_ss1, pred_ss2, pred_cd, pred_bd = self(t1, t2)
         
-        loss, _ = self.criterion((pred_ss1, pred_ss2, pred_cd, pred_bd), (l1, l2, gt_cd, gt_bd))
+        loss, _ = self.criterion((pred_ss1, pred_ss2, pred_cd, pred_bd), (l1, l2, gt_cd, extract_boundary(gt_cd)))
         self.log('val_loss', loss, on_epoch=True, sync_dist=True)
         
         p_ss1, p_ss2 = torch.argmax(pred_ss1, dim=1), torch.argmax(pred_ss2, dim=1)
@@ -121,7 +112,6 @@ class BoundNeXtLightning(pl.LightningModule):
                 return v.item() if isinstance(v, torch.Tensor) else v
 
             res = self.last_val_metrics
-            # [RESTORED mIoU]
             print(f" {self.current_epoch:^7} | {gv('t_loss'):^8.4f} | {gv('s_loss'):^8.4f} | {gv('b_loss'):^8.4f} | {gv('val_loss'):^8.4f} | {res['sek']:^7.4f} | {res['f1_bcd']:^7.4f} | {res['miou']:^7.4f} | {res['score']:^7.4f}")
 
     def configure_optimizers(self):
@@ -146,13 +136,24 @@ def main():
     pl.seed_everything(args.seed, workers=True)
     os.makedirs(args.save_dir, exist_ok=True)
 
+    # Added persistent_workers=True to safely manage DataLoader memory overhead
     train_loader = DataLoader(SCDDataset(root=args.data_root, mode='train', dataset_name=args.dataset_name, patch_mode=False), 
-                              batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
+                              batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True, drop_last=True, persistent_workers=True)
     val_loader = DataLoader(SCDDataset(root=args.data_root, mode='val', dataset_name=args.dataset_name, patch_mode=False), 
-                            batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+                            batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True, persistent_workers=True)
 
     model = BoundNeXtLightning(args)
-    checkpoint_callback = ModelCheckpoint(dirpath=args.save_dir, monitor="val_score", mode="max", save_last=True, filename="best_model")
+    
+    # [FIX] Dynamic filename ensures PL correctly overwrites the old checkpoint and keeps disk usage small!
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=args.save_dir, 
+        monitor="val_score", 
+        mode="max", 
+        save_top_k=1, 
+        save_last=True, 
+        filename="best_model_{epoch:02d}_{val_score:.4f}",
+        auto_insert_metric_name=False
+    )
 
     trainer = pl.Trainer(
         devices="auto", accelerator="gpu", strategy="ddp_find_unused_parameters_true",  
