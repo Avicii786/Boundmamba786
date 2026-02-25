@@ -184,7 +184,7 @@ def main():
         devices="auto", accelerator="gpu", strategy="ddp_find_unused_parameters_true",  
         max_epochs=args.epochs, precision="16-mixed", 
         callbacks=[checkpoint_callback, CleanupCallback()], # Added forceful cleanup
-        enable_progress_bar=True, logger=False,
+        enable_progress_bar=False, logger=False,
         sync_batchnorm=True 
     )
 
