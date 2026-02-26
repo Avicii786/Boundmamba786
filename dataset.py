@@ -9,7 +9,6 @@ from torchvision import transforms
 from PIL import Image
 
 # Import the centralized normalization logic
-# NOTE: Adjusted import path for project structure
 from utils import normalization_utils as norm_utils
 
 # ==============================================================================
@@ -68,13 +67,14 @@ def Color2Index(ColorLabel, lookup_table, num_classes):
 # ==============================================================================
 
 class SCDDataset(data.Dataset):
-    def __init__(self, root, mode, dataset_name='SECOND', patch_mode=True, random_flip=False, random_swap=False):
+    # SOTA FIX: Forced random_flip and random_swap to True by default for train
+    def __init__(self, root, mode, dataset_name='SECOND', patch_mode=True, random_flip=True, random_swap=True):
         self.root = root
         self.mode = mode
         self.dataset_name = dataset_name
         self.patch_mode = patch_mode
-        self.random_flip = random_flip
-        self.random_swap = random_swap
+        self.random_flip = random_flip if mode == 'train' else False
+        self.random_swap = random_swap if mode == 'train' else False
         
         if 'second' in dataset_name.lower():
             self.lookup_table = st_colormap2label
@@ -134,6 +134,7 @@ class SCDDataset(data.Dataset):
         else: return img
 
     def _sync_transform(self, img_A, img_B, sem1, sem2, bcd):
+        # 1. Random Resized Crop
         if random.random() < 0.5:
             w_orig, h_orig = img_A.size
             i, j, h, w = transforms.RandomResizedCrop.get_params(img_A, scale=(0.5, 1.0), ratio=(0.75, 1.33))
@@ -143,21 +144,24 @@ class SCDDataset(data.Dataset):
             sem2 = TF.resized_crop(sem2, i, j, h, w, (h_orig, w_orig), interpolation=transforms.InterpolationMode.NEAREST)
             bcd = TF.resized_crop(bcd, i, j, h, w, (h_orig, w_orig), interpolation=transforms.InterpolationMode.NEAREST)
 
-        if random.random() > 0.5:
-            img_A = TF.hflip(img_A); img_B = TF.hflip(img_B)
-            sem1 = TF.hflip(sem1); sem2 = TF.hflip(sem2); bcd = TF.hflip(bcd)
-
-        if random.random() > 0.5:
-            img_A = TF.vflip(img_A); img_B = TF.vflip(img_B)
-            sem1 = TF.vflip(sem1); sem2 = TF.vflip(sem2); bcd = TF.vflip(bcd)
+        # 2. Flips
+        if self.random_flip:
+            if random.random() > 0.5:
+                img_A = TF.hflip(img_A); img_B = TF.hflip(img_B)
+                sem1 = TF.hflip(sem1); sem2 = TF.hflip(sem2); bcd = TF.hflip(bcd)
+            if random.random() > 0.5:
+                img_A = TF.vflip(img_A); img_B = TF.vflip(img_B)
+                sem1 = TF.vflip(sem1); sem2 = TF.vflip(sem2); bcd = TF.vflip(bcd)
             
-        if random.random() > 0.5:
-            rotations = [0, 90, 180, 270]
-            angle = random.choice(rotations)
-            if angle > 0:
-                img_A = TF.rotate(img_A, angle); img_B = TF.rotate(img_B, angle)
-                sem1 = TF.rotate(sem1, angle); sem2 = TF.rotate(sem2, angle); bcd = TF.rotate(bcd, angle)
+            # Rotations
+            if random.random() > 0.5:
+                rotations = [0, 90, 180, 270]
+                angle = random.choice(rotations)
+                if angle > 0:
+                    img_A = TF.rotate(img_A, angle); img_B = TF.rotate(img_B, angle)
+                    sem1 = TF.rotate(sem1, angle); sem2 = TF.rotate(sem2, angle); bcd = TF.rotate(bcd, angle)
 
+        # 3. Color & Blur
         if random.random() < 0.8: img_A = self.color_jitter(img_A)
         if random.random() < 0.8: img_B = self.color_jitter(img_B)
         if random.random() < 0.5: img_A = self.gaussian_blur(img_A)
@@ -202,6 +206,8 @@ class SCDDataset(data.Dataset):
 
         if self.mode == 'train':
             p_img_A, p_img_B, p_sem1, p_sem2, p_bcd = self._sync_transform(p_img_A, p_img_B, p_sem1, p_sem2, p_bcd)
+            
+            # SOTA FIX: Temporal Swap helps the model learn transition bi-directionally
             if self.random_swap and random.random() > 0.5:
                 p_img_A, p_img_B = p_img_B, p_img_A
                 p_sem1, p_sem2 = p_sem2, p_sem1
@@ -221,7 +227,6 @@ class SCDDataset(data.Dataset):
         t_sem2 = torch.from_numpy(label_sem2).long()
         t_bcd = torch.from_numpy(label_bcd).float()
 
-        # NOTE: Dictionary keys lowercased for consistency
         return {
             'img_A': t_img_A,
             'img_B': t_img_B,
