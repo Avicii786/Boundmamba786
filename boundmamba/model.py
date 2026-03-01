@@ -32,7 +32,7 @@ class BoundNeXt(nn.Module):
         self.encoder = SiameseConvNeXtV2(
             model_type=model_type,
             checkpoint_path=pretrained_path,
-            drop_path_rate=0.3 # Increased drop_path for base model regularization
+            drop_path_rate=0.3 
         )
         dims = self.encoder.dims 
         
@@ -96,12 +96,5 @@ class BoundNeXt(nn.Module):
         out_cd = F.interpolate(out_cd, size=img_size, mode='bilinear')
         out_bd = F.interpolate(boundary_logits, size=img_size, mode='bilinear')
         
-        # SOTA Trick: Task Alignment during Inference
-        if not self.training:
-            # If BCD predicts 0 (no change), force SS2 to match SS1's logic
-            # This mathematically guarantees no SeK pseudo-change penalty.
-            cd_mask = (torch.sigmoid(out_cd) > 0.5).float()
-            # Where cd_mask is 0 (no change), blend ss2 into ss1
-            out_ss2 = (cd_mask * out_ss2) + ((1.0 - cd_mask) * out_ss1)
-
+        # SOTA FIX: Raw logits are returned to prevent gradient starvation in dec_ss2
         return out_ss1, out_ss2, out_cd, out_bd
