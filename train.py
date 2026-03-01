@@ -13,7 +13,7 @@ warnings.filterwarnings("ignore")
 logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
 
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint, Callback
+from pytorch_lightning.callbacks import ModelCheckpoint, Callback, StochasticWeightAveraging
 
 from boundmamba import BoundNeXt, BoundMambaLoss
 from boundmamba.utils import extract_boundary
@@ -25,13 +25,11 @@ class CleanupCallback(Callback):
         if trainer.is_global_zero:
             ckpt_dir = trainer.checkpoint_callback.dirpath
             best_path = trainer.checkpoint_callback.best_model_path
-            
             all_ckpts = glob.glob(os.path.join(ckpt_dir, "*.ckpt"))
             for ckpt in all_ckpts:
                 if ckpt != best_path:
                     try: os.remove(ckpt)
                     except: pass
-            
             gc.collect()
             torch.cuda.empty_cache()
 
@@ -42,7 +40,7 @@ class BoundNeXtLightning(pl.LightningModule):
         self.args = args
         num_classes = 7 if args.dataset_name.upper() == 'SECOND' else 5
         self.model = BoundNeXt(num_classes=num_classes, pretrained_path=args.weights, model_type=args.model_type)
-        self.criterion = BoundMambaLoss()
+        self.criterion = BoundMambaLoss(num_classes=num_classes)
         self.metrics = SCDMetrics(num_classes=num_classes)
 
     def forward(self, t1, t2): return self.model(t1, t2)
@@ -82,11 +80,21 @@ class BoundNeXtLightning(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         t1, t2, l1, l2, gt_cd = batch['img_A'], batch['img_B'], batch['sem1'], batch['sem2'], batch['bcd']
         pred_ss1, pred_ss2, pred_cd, pred_bd = self(t1, t2)
-        loss, _ = self.criterion((pred_ss1, pred_ss2, pred_cd, pred_bd), (l1, l2, gt_cd, extract_boundary(gt_cd)))
         
+        # Validation Loss relies on raw unadulterated logits
+        loss, _ = self.criterion((pred_ss1, pred_ss2, pred_cd, pred_bd), (l1, l2, gt_cd, extract_boundary(gt_cd)))
         self.log('val_loss', loss, on_epoch=True, sync_dist=True)
-        p_ss1, p_ss2 = torch.argmax(pred_ss1, dim=1), torch.argmax(pred_ss2, dim=1)
+        
+        p_ss1 = torch.argmax(pred_ss1, dim=1)
+        p_ss2 = torch.argmax(pred_ss2, dim=1)
         p_cd = (torch.sigmoid(pred_cd) > 0.5).long().squeeze(1)
+        
+        # =====================================================================
+        # SOTA INFERENCE TRICK: Applied ONLY after the gradient graph is complete.
+        # This guarantees SeK scores without blocking dec_ss2 backward gradients.
+        # =====================================================================
+        p_ss2 = torch.where(p_cd == 0, p_ss1, p_ss2)
+        
         self.metrics.update(p_ss1, p_ss2, p_cd, l1, l2, gt_cd)
 
     def on_validation_epoch_end(self):
@@ -119,13 +127,13 @@ class BoundNeXtLightning(pl.LightningModule):
             else:
                 decoder_params.append(param)
                 
-        # The backbone gets 10x smaller learning rate so it doesn't forget ImageNet weights
+        # The backbone gets 10x smaller learning rate to preserve ImageNet generalizations
         optimizer = optim.AdamW([
             {'params': backbone_params, 'lr': self.args.lr * 0.1}, 
             {'params': decoder_params, 'lr': self.args.lr}
         ], weight_decay=0.05)
         
-        # Smooth single-cycle decay over 100 epochs
+        # Smooth single-cycle Cosine Decay over 100 epochs
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.args.epochs, eta_min=1e-6)
         
         return [optimizer], [scheduler]
@@ -137,7 +145,7 @@ def main():
     parser.add_argument('--model_type', type=str, default='convnextv2_base')
     parser.add_argument('--weights', type=str, default=None)
     parser.add_argument('--batch_size', type=int, default=4)
-    parser.add_argument('--epochs', type=int, default=100) # Set default to 100
+    parser.add_argument('--epochs', type=int, default=100) 
     parser.add_argument('--freeze_epochs', type=int, default=5)
     parser.add_argument('--lr', type=float, default=1e-4) 
     parser.add_argument('--save_dir', type=str, default='/kaggle/working/checkpoints')
@@ -155,10 +163,18 @@ def main():
     model = BoundNeXtLightning(args)
     checkpoint_callback = ModelCheckpoint(dirpath=args.save_dir, monitor="val_score", mode="max", save_top_k=1, save_last=False, filename="best_model", save_weights_only=True)
 
-    trainer = pl.Trainer(devices="auto", accelerator="gpu", strategy="ddp_find_unused_parameters_true", max_epochs=args.epochs, precision="16-mixed", callbacks=[checkpoint_callback, CleanupCallback()], enable_progress_bar=False, logger=False, sync_batchnorm=True)
+    # SOTA FIX: Stochastic Weight Averaging holds validation generalization for the final 40 epochs
+    swa_callback = StochasticWeightAveraging(swa_lrs=1e-5, swa_epoch_start=0.6)
+
+    trainer = pl.Trainer(
+        devices="auto", accelerator="gpu", strategy="ddp_find_unused_parameters_true", 
+        max_epochs=args.epochs, precision="16-mixed", 
+        callbacks=[checkpoint_callback, CleanupCallback(), swa_callback], 
+        enable_progress_bar=False, logger=False, sync_batchnorm=True
+    )
 
     if trainer.is_global_zero:
-        print(f"\n🚀 BoundNeXt Training: {args.model_type.upper()} | LR: {args.lr} (Decoders) & {args.lr*0.1} (Backbone) | Epochs: {args.epochs}")
+        print(f"\n🚀 BoundNeXt: {args.model_type.upper()} | SyncBN: ON | SWA: ON (Epoch 60) | SCL: ON")
     trainer.fit(model, train_loader, val_loader)
 
 if __name__ == '__main__':
