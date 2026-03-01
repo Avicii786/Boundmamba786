@@ -5,6 +5,7 @@ import torch
 import numpy as np
 import torch.optim as optim
 from torch.utils.data import DataLoader
+import torchvision.transforms.functional as TF
 import warnings
 import logging
 import gc
@@ -79,20 +80,41 @@ class BoundNeXtLightning(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         t1, t2, l1, l2, gt_cd = batch['img_A'], batch['img_B'], batch['sem1'], batch['sem2'], batch['bcd']
-        pred_ss1, pred_ss2, pred_cd, pred_bd = self(t1, t2)
         
-        # Validation Loss relies on raw unadulterated logits
-        loss, _ = self.criterion((pred_ss1, pred_ss2, pred_cd, pred_bd), (l1, l2, gt_cd, extract_boundary(gt_cd)))
+        # =====================================================================
+        # [SOTA FIX] TEST-TIME AUGMENTATION (TTA)
+        # Calculates predictions normally, horizontally, and vertically, then averages.
+        # =====================================================================
+        # 1. Normal Pass
+        logits_ss1, logits_ss2, logits_cd, logits_bd = self(t1, t2)
+        
+        # 2. Horizontal Flip Pass
+        h_ss1, h_ss2, h_cd, _ = self(TF.hflip(t1), TF.hflip(t2))
+        logits_ss1 += TF.hflip(h_ss1)
+        logits_ss2 += TF.hflip(h_ss2)
+        logits_cd += TF.hflip(h_cd)
+        
+        # 3. Vertical Flip Pass
+        v_ss1, v_ss2, v_cd, _ = self(TF.vflip(t1), TF.vflip(t2))
+        logits_ss1 += TF.vflip(v_ss1)
+        logits_ss2 += TF.vflip(v_ss2)
+        logits_cd += TF.vflip(v_cd)
+        
+        # Average the logits
+        logits_ss1 /= 3.0
+        logits_ss2 /= 3.0
+        logits_cd /= 3.0
+
+        # Calculate Validation Loss
+        loss, _ = self.criterion((logits_ss1, logits_ss2, logits_cd, logits_bd), (l1, l2, gt_cd, extract_boundary(gt_cd)))
         self.log('val_loss', loss, on_epoch=True, sync_dist=True)
         
-        p_ss1 = torch.argmax(pred_ss1, dim=1)
-        p_ss2 = torch.argmax(pred_ss2, dim=1)
-        p_cd = (torch.sigmoid(pred_cd) > 0.5).long().squeeze(1)
+        # Discrete Predictions
+        p_ss1 = torch.argmax(logits_ss1, dim=1)
+        p_ss2 = torch.argmax(logits_ss2, dim=1)
+        p_cd = (torch.sigmoid(logits_cd) > 0.5).long().squeeze(1)
         
-        # =====================================================================
-        # SOTA INFERENCE TRICK: Applied ONLY after the gradient graph is complete.
-        # This guarantees SeK scores without blocking dec_ss2 backward gradients.
-        # =====================================================================
+        # SOTA Inference Task Alignment Trick
         p_ss2 = torch.where(p_cd == 0, p_ss1, p_ss2)
         
         self.metrics.update(p_ss1, p_ss2, p_cd, l1, l2, gt_cd)
@@ -120,22 +142,18 @@ class BoundNeXtLightning(pl.LightningModule):
 
     def configure_optimizers(self):
         backbone_params, decoder_params = [], []
-        
         for name, param in self.model.named_parameters():
             if 'encoder' in name:
                 backbone_params.append(param)
             else:
                 decoder_params.append(param)
                 
-        # The backbone gets 10x smaller learning rate to preserve ImageNet generalizations
         optimizer = optim.AdamW([
             {'params': backbone_params, 'lr': self.args.lr * 0.1}, 
             {'params': decoder_params, 'lr': self.args.lr}
         ], weight_decay=0.05)
         
-        # Smooth single-cycle Cosine Decay over 100 epochs
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.args.epochs, eta_min=1e-6)
-        
         return [optimizer], [scheduler]
 
 def main():
@@ -162,8 +180,6 @@ def main():
 
     model = BoundNeXtLightning(args)
     checkpoint_callback = ModelCheckpoint(dirpath=args.save_dir, monitor="val_score", mode="max", save_top_k=1, save_last=False, filename="best_model", save_weights_only=True)
-
-    # SOTA FIX: Stochastic Weight Averaging holds validation generalization for the final 40 epochs
     swa_callback = StochasticWeightAveraging(swa_lrs=1e-5, swa_epoch_start=0.6)
 
     trainer = pl.Trainer(
@@ -174,7 +190,7 @@ def main():
     )
 
     if trainer.is_global_zero:
-        print(f"\n🚀 BoundNeXt: {args.model_type.upper()} | SyncBN: ON | SWA: ON (Epoch 60) | SCL: ON")
+        print(f"\n🚀 BoundNeXt: {args.model_type.upper()} | SyncBN: ON | TTA: ON | BCD-Focal: ON")
     trainer.fit(model, train_loader, val_loader)
 
 if __name__ == '__main__':
