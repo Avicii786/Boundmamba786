@@ -4,6 +4,35 @@ import torch.nn.functional as F
 from .backbone import SiameseConvNeXtV2
 from .modules import SC_UP_Module, BGI_Module, UWFF_Head
 
+# =====================================================================
+# [SOTA FIX] Learnable Temporal Fusion to replace naive torch.abs()
+# =====================================================================
+class TemporalFusionModule(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(channels * 2, channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True)
+        )
+        # Squeeze-and-Excitation Channel Attention to highlight "changed" features
+        self.attention = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, channels // 4, 1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // 4, channels, 1, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x1, x2):
+        x = torch.cat([x1, x2], dim=1) # Concatenate temporally
+        x = self.conv(x)
+        attn = self.attention(x)
+        return x * attn
+
 class DecoderBlock(nn.Module):
     def __init__(self, in_ch, skip_ch, out_ch):
         super().__init__()
@@ -37,6 +66,9 @@ class BoundNeXt(nn.Module):
         dims = self.encoder.dims 
         
         self.sc_up = SC_UP_Module(dims[3])
+        
+        # Initialize the Temporal Fusion Module
+        self.temporal_fusion = TemporalFusionModule(dims[3])
         
         self.boundary_head = nn.Sequential(
             nn.Conv2d(dims[0], 64, 3, padding=1),
@@ -72,7 +104,9 @@ class BoundNeXt(nn.Module):
         boundary_map = torch.sigmoid(boundary_logits)
         
         f1_3, f2_3 = self.sc_up(f1_list[3], f2_list[3])
-        cd_3 = torch.abs(f1_3 - f2_3)
+        
+        # [SOTA FIX] Use Learnable Attention instead of torch.abs()
+        cd_3 = self.temporal_fusion(f1_3, f2_3)
         
         x1 = self.dec_ss1_3(f1_3, f1_list[2])
         x2 = self.dec_ss2_3(f2_3, f2_list[2])
@@ -96,5 +130,4 @@ class BoundNeXt(nn.Module):
         out_cd = F.interpolate(out_cd, size=img_size, mode='bilinear')
         out_bd = F.interpolate(boundary_logits, size=img_size, mode='bilinear')
         
-        # SOTA FIX: Raw logits are returned to prevent gradient starvation in dec_ss2
         return out_ss1, out_ss2, out_cd, out_bd
