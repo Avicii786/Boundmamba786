@@ -32,7 +32,10 @@ class CleanupCallback(Callback):
                     try: os.remove(ckpt)
                     except: pass
             gc.collect()
-            torch.cuda.empty_cache()
+            
+            # [TPU FIX] Only call cuda empty_cache if running on GPU
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 class BoundNeXtLightning(pl.LightningModule):
     def __init__(self, args):
@@ -159,6 +162,10 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-4) 
     parser.add_argument('--save_dir', type=str, default='/kaggle/working/checkpoints')
     parser.add_argument('--seed', type=int, default=42)
+    
+    # [TPU CONFIG] Dynamic hardware routing
+    parser.add_argument('--accelerator', type=str, default='gpu', choices=['gpu', 'tpu', 'cpu', 'auto'])
+    parser.add_argument('--devices', type=str, default='auto')
     args = parser.parse_args()
 
     pl.seed_everything(args.seed, workers=True)
@@ -172,16 +179,30 @@ def main():
     model = BoundNeXtLightning(args)
     checkpoint_callback = ModelCheckpoint(dirpath=args.save_dir, monitor="val_score", mode="max", save_top_k=1, save_last=False, filename="best_model", save_weights_only=True)
 
-    # [FIX] SWA removed to prevent AMP/DDP framework crashes. Model is already stable.
+    # [TPU CONFIG] Hardware specific logic
+    strategy = "ddp_find_unused_parameters_true" if args.accelerator == 'gpu' else "auto"
+    devices = int(args.devices) if args.devices.isdigit() else args.devices
+    
+    # TPUs are optimized for bfloat16, GPUs use float16
+    precision = "16-mixed" if args.accelerator == 'gpu' else "bf16-mixed"
+    
+    # SyncBN can sometimes hang TPU mesh networking, safer to disable it automatically for TPU
+    sync_bn = True if args.accelerator == 'gpu' else False
+
     trainer = pl.Trainer(
-        devices="auto", accelerator="gpu", strategy="ddp_find_unused_parameters_true", 
-        max_epochs=args.epochs, precision="16-mixed", 
+        accelerator=args.accelerator, 
+        devices=devices, 
+        strategy=strategy, 
+        max_epochs=args.epochs, 
+        precision=precision, 
         callbacks=[checkpoint_callback, CleanupCallback()], 
-        enable_progress_bar=False, logger=False, sync_batchnorm=True
+        enable_progress_bar=False, 
+        logger=False, 
+        sync_batchnorm=sync_bn
     )
 
     if trainer.is_global_zero:
-        print(f"\n🚀 BoundNeXt: {args.model_type.upper()} | TemporalFusion: ON | TTA: ON | SCL: ON")
+        print(f"\n🚀 BoundNeXt: {args.model_type.upper()} | Accel: {args.accelerator.upper()} | TemporalFusion: ON | TTA: ON | SCL: ON")
     trainer.fit(model, train_loader, val_loader)
 
 if __name__ == '__main__':
