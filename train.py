@@ -14,7 +14,7 @@ warnings.filterwarnings("ignore")
 logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
 
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint, Callback, StochasticWeightAveraging
+from pytorch_lightning.callbacks import ModelCheckpoint, Callback
 
 from boundmamba import BoundNeXt, BoundMambaLoss
 from boundmamba.utils import extract_boundary
@@ -81,42 +81,33 @@ class BoundNeXtLightning(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         t1, t2, l1, l2, gt_cd = batch['img_A'], batch['img_B'], batch['sem1'], batch['sem2'], batch['bcd']
         
-        # =====================================================================
-        # [SOTA FIX] TEST-TIME AUGMENTATION (TTA)
-        # Calculates predictions normally, horizontally, and vertically, then averages.
-        # =====================================================================
-        # 1. Normal Pass
+        # Normal Pass
         logits_ss1, logits_ss2, logits_cd, logits_bd = self(t1, t2)
         
-        # 2. Horizontal Flip Pass
+        # Horizontal Flip Pass
         h_ss1, h_ss2, h_cd, _ = self(TF.hflip(t1), TF.hflip(t2))
         logits_ss1 += TF.hflip(h_ss1)
         logits_ss2 += TF.hflip(h_ss2)
         logits_cd += TF.hflip(h_cd)
         
-        # 3. Vertical Flip Pass
+        # Vertical Flip Pass
         v_ss1, v_ss2, v_cd, _ = self(TF.vflip(t1), TF.vflip(t2))
         logits_ss1 += TF.vflip(v_ss1)
         logits_ss2 += TF.vflip(v_ss2)
         logits_cd += TF.vflip(v_cd)
         
-        # Average the logits
         logits_ss1 /= 3.0
         logits_ss2 /= 3.0
         logits_cd /= 3.0
 
-        # Calculate Validation Loss
         loss, _ = self.criterion((logits_ss1, logits_ss2, logits_cd, logits_bd), (l1, l2, gt_cd, extract_boundary(gt_cd)))
         self.log('val_loss', loss, on_epoch=True, sync_dist=True)
         
-        # Discrete Predictions
         p_ss1 = torch.argmax(logits_ss1, dim=1)
         p_ss2 = torch.argmax(logits_ss2, dim=1)
         p_cd = (torch.sigmoid(logits_cd) > 0.5).long().squeeze(1)
         
-        # SOTA Inference Task Alignment Trick
         p_ss2 = torch.where(p_cd == 0, p_ss1, p_ss2)
-        
         self.metrics.update(p_ss1, p_ss2, p_cd, l1, l2, gt_cd)
 
     def on_validation_epoch_end(self):
@@ -180,17 +171,17 @@ def main():
 
     model = BoundNeXtLightning(args)
     checkpoint_callback = ModelCheckpoint(dirpath=args.save_dir, monitor="val_score", mode="max", save_top_k=1, save_last=False, filename="best_model", save_weights_only=True)
-    swa_callback = StochasticWeightAveraging(swa_lrs=1e-5, swa_epoch_start=0.6)
 
+    # [FIX] SWA removed to prevent AMP/DDP framework crashes. Model is already stable.
     trainer = pl.Trainer(
         devices="auto", accelerator="gpu", strategy="ddp_find_unused_parameters_true", 
         max_epochs=args.epochs, precision="16-mixed", 
-        callbacks=[checkpoint_callback, CleanupCallback(), swa_callback], 
+        callbacks=[checkpoint_callback, CleanupCallback()], 
         enable_progress_bar=False, logger=False, sync_batchnorm=True
     )
 
     if trainer.is_global_zero:
-        print(f"\n🚀 BoundNeXt: {args.model_type.upper()} | SyncBN: ON | TTA: ON | BCD-Focal: ON")
+        print(f"\n🚀 BoundNeXt: {args.model_type.upper()} | TemporalFusion: ON | TTA: ON | SCL: ON")
     trainer.fit(model, train_loader, val_loader)
 
 if __name__ == '__main__':
