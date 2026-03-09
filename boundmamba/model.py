@@ -6,7 +6,7 @@ from .modules import SC_UP_Module, BGI_Module, UWFF_Head
 
 # =====================================================================
 # [SOTA NOVELTY] Boundary-Conditioned Temporal Fusion (BCTF)
-# Replaces dumb subtraction with Edge-Aware Global Cross-Attention
+# With FP16 Numerical Stability Patches for Mixed Precision Training
 # =====================================================================
 class BoundaryConditionedFusion(nn.Module):
     def __init__(self, in_channels, num_heads=8):
@@ -14,6 +14,9 @@ class BoundaryConditionedFusion(nn.Module):
         self.num_heads = num_heads
         self.head_dim = in_channels // num_heads
         self.scale = self.head_dim ** -0.5
+
+        # [STABILITY FIX 1] Input Normalization to prevent variance explosion
+        self.norm_in = nn.BatchNorm2d(in_channels * 2)
 
         # Projects concatenated temporal features into Q, K, V
         self.qkv_conv = nn.Conv2d(in_channels * 2, in_channels * 3, kernel_size=1, bias=False)
@@ -39,17 +42,19 @@ class BoundaryConditionedFusion(nn.Module):
         B, C, H, W = f1.shape
         
         # 1. Prepare the Boundary Prior
-        # Downsample the high-res boundary map to the current deep feature resolution
         b_down = F.interpolate(boundary_map, size=(H, W), mode='bilinear', align_corners=False)
         b_weight = self.boundary_proj(b_down) # Shape: [B, C, H, W]
         
         # 2. Extract Q, K, V from temporal features
         x = torch.cat([f1, f2], dim=1) # Shape: [B, 2C, H, W]
-        qkv = self.qkv_conv(x)         # Shape: [B, 3C, H, W]
+        
+        # Apply Input Normalization
+        x_norm = self.norm_in(x)
+        
+        qkv = self.qkv_conv(x_norm)    # Shape: [B, 3C, H, W]
         q, k, v = qkv.chunk(3, dim=1)  # Each is [B, C, H, W]
         
-        # 3. [THE NOVELTY] Condition Queries and Keys with the Boundary Prior
-        # This forces the attention matrix to prioritize structural edges over textures/shadows
+        # 3. Condition Queries and Keys with the Boundary Prior
         q = q * (1.0 + b_weight)
         k = k * (1.0 + b_weight)
         
@@ -60,8 +65,12 @@ class BoundaryConditionedFusion(nn.Module):
         v = v.view(B, self.num_heads, self.head_dim, N).transpose(-2, -1) # [B, heads, N, head_dim]
         
         # 5. Calculate Edge-Aware Attention Matrix
-        attn = (q @ k) * self.scale # [B, heads, N, N]
-        attn = attn.softmax(dim=-1)
+        # [STABILITY FIX 2] Apply scale to Q before matrix multiplication
+        q = q * self.scale
+        
+        # [STABILITY FIX 3] Upcast to FP32 purely for the Softmax calculation to prevent NaN
+        attn = (q.float() @ k.float()) # Output is temporarily float32
+        attn = attn.softmax(dim=-1).to(v.dtype) # Softmax applied safely, cast back to mixed precision
         
         # 6. Apply Attention to Values
         out = (attn @ v).transpose(-2, -1).reshape(B, C, H, W) # [B, C, H, W]
@@ -106,7 +115,7 @@ class BoundNeXt(nn.Module):
         
         self.sc_up = SC_UP_Module(dims[3])
         
-        # [INTEGRATION] Initialize the Novel Boundary-Conditioned Fusion Block
+        # Initialize the Novel Boundary-Conditioned Fusion Block
         self.temporal_fusion = BoundaryConditionedFusion(in_channels=dims[3], num_heads=8)
         
         self.boundary_head = nn.Sequential(
@@ -145,7 +154,7 @@ class BoundNeXt(nn.Module):
         
         f1_3, f2_3 = self.sc_up(f1_list[3], f2_list[3])
         
-        # 2. [SOTA FIX] Pass Temporal Features AND Boundary Prior into Attention Block
+        # 2. Pass Temporal Features AND Boundary Prior into Attention Block
         cd_3 = self.temporal_fusion(f1_3, f2_3, boundary_map)
         
         x1 = self.dec_ss1_3(f1_3, f1_list[2])
