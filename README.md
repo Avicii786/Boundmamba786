@@ -1,5 +1,6 @@
 # Boundmamba786: Proposed New Title: BoundNeXt: Dual-Phase Task and Temporal Interaction with Boundary Constraints for Semantic Change Detection
 
+Gemini link : https://gemini.google.com/app/2cf083ef97af628a
 
 ### 1. Changes Made
 
