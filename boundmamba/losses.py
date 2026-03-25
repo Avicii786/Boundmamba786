@@ -2,6 +2,33 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+class OHEMCrossEntropyLoss(nn.Module):
+    """
+    [SOTA FIX 2] Online Hard Example Mining (OHEM)
+    Forces the network to ignore the 30% easiest pixels in every batch
+    and dedicate all CE gradient power to the hardest minority classes.
+    """
+    def __init__(self, ignore_index=255, keep_ratio=0.7):
+        super().__init__()
+        self.ignore_index = ignore_index
+        self.keep_ratio = keep_ratio
+        self.ce = nn.CrossEntropyLoss(ignore_index=ignore_index, reduction='none')
+
+    def forward(self, logits, targets):
+        loss = self.ce(logits, targets)
+        loss = loss.view(-1)
+        valid_mask = (targets.view(-1) != self.ignore_index)
+        loss = loss[valid_mask]
+        
+        if len(loss) == 0:
+            return loss.sum()
+            
+        num_kept = int(len(loss) * self.keep_ratio)
+        if num_kept > 0:
+            loss, _ = torch.topk(loss, num_kept)
+            
+        return loss.mean()
+
 class DiceLoss(nn.Module):
     def __init__(self, smooth=1.0):
         super().__init__()
@@ -34,7 +61,6 @@ class MultiClassDiceLoss(nn.Module):
         dice = (2.0 * intersection + self.smooth) / (union + self.smooth)
         return 1.0 - dice.mean()
 
-# [SOTA FIX] Binary Focal Loss targets the 72% F1-BCD bottleneck
 class BinaryFocalLoss(nn.Module):
     def __init__(self, alpha=0.25, gamma=2.0):
         super().__init__()
@@ -43,11 +69,15 @@ class BinaryFocalLoss(nn.Module):
 
     def forward(self, logits, targets):
         bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
-        pt = torch.exp(-bce_loss) # Probability of the correct class
+        pt = torch.exp(-bce_loss) 
         focal_loss = self.alpha * (1 - pt) ** self.gamma * bce_loss
         return focal_loss.mean()
 
-class SemanticConsistencyLoss(nn.Module):
+class SymmetricSCLoss(nn.Module):
+    """
+    [SOTA FIX 3] Symmetric MSE Consistency
+    Replaced erratic Absolute Difference on raw probabilities with stable MSE.
+    """
     def __init__(self):
         super().__init__()
 
@@ -55,39 +85,42 @@ class SemanticConsistencyLoss(nn.Module):
         unchanged_mask = (gt_cd == 0).unsqueeze(1).float() 
         probs1 = F.softmax(logits1, dim=1)
         probs2 = F.softmax(logits2, dim=1)
-        diff = torch.abs(probs1 - probs2) * unchanged_mask
+        
+        # Detached symmetric MSE prevents catastrophic gradient collapse
+        mse1 = F.mse_loss(probs1, probs2.detach(), reduction='none') * unchanged_mask
+        mse2 = F.mse_loss(probs2, probs1.detach(), reduction='none') * unchanged_mask
+        
         num_unchanged = unchanged_mask.sum()
         if num_unchanged > 0:
-            return diff.sum() / num_unchanged
+            return (mse1.sum() + mse2.sum()) / (num_unchanged * 2)
         return torch.tensor(0.0, device=logits1.device)
 
 class BoundMambaLoss(nn.Module):
     def __init__(self, num_classes=7, ignore_index=255):
         super().__init__()
         
-        self.ce = nn.CrossEntropyLoss(ignore_index=ignore_index)
+        self.ohem_ce = OHEMCrossEntropyLoss(ignore_index=ignore_index, keep_ratio=0.7)
         self.mc_dice = MultiClassDiceLoss(num_classes=num_classes, ignore_index=ignore_index)
-        self.scl = SemanticConsistencyLoss()
+        self.scl = SymmetricSCLoss()
         
-        # Upgraded to Binary Focal Loss for the Change Mask
         self.bce_focal = BinaryFocalLoss(alpha=0.25, gamma=2.0)
         self.dice = DiceLoss()
         
+        # Adjusted weights for proper gradient prioritization
         self.lambda_ss = 1.0 
-        self.lambda_cd = 1.0
-        self.lambda_bd = 1.0
-        self.lambda_scl = 1.0 
+        self.lambda_cd = 2.0  # Increased to boost F1-BCD bottleneck
+        self.lambda_bd = 0.5  # Auxiliary tasks should not overpower main tasks
+        self.lambda_scl = 0.2 # Significantly reduced to prevent washing out CE gradients
 
     def forward(self, outputs, targets):
         pred_ss1, pred_ss2, pred_cd, pred_bd = outputs
         gt_ss1, gt_ss2, gt_cd, gt_bd = targets
         
-        l_ss = self.ce(pred_ss1, gt_ss1.long()) + self.ce(pred_ss2, gt_ss2.long()) + \
+        l_ss = self.ohem_ce(pred_ss1, gt_ss1.long()) + self.ohem_ce(pred_ss2, gt_ss2.long()) + \
                self.mc_dice(pred_ss1, gt_ss1.long()) + self.mc_dice(pred_ss2, gt_ss2.long())
                
         l_scl = self.scl(pred_ss1, pred_ss2, gt_cd)
         
-        # Focal + Dice for BCD
         l_cd = self.bce_focal(pred_cd, gt_cd.float().unsqueeze(1)) + self.dice(torch.sigmoid(pred_cd), gt_cd.float().unsqueeze(1))
         l_bd = self.dice(torch.sigmoid(pred_bd), gt_bd.float().unsqueeze(1))
         
