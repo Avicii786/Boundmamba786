@@ -5,7 +5,6 @@ import torch
 import numpy as np
 import torch.optim as optim
 from torch.utils.data import DataLoader
-import torchvision.transforms.functional as TF
 import warnings
 import logging
 import gc
@@ -82,24 +81,9 @@ class BoundNeXtLightning(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         t1, t2, l1, l2, gt_cd = batch['img_A'], batch['img_B'], batch['sem1'], batch['sem2'], batch['bcd']
         
-        # Normal Pass
+        # [SOTA FIX 4] Removed TTA from Validation Loop. 
+        # TTA artificially inflates metrics during training and destroys accurate V-Loss tracking.
         logits_ss1, logits_ss2, logits_cd, logits_bd = self(t1, t2)
-        
-        # Horizontal Flip Pass
-        h_ss1, h_ss2, h_cd, _ = self(TF.hflip(t1), TF.hflip(t2))
-        logits_ss1 += TF.hflip(h_ss1)
-        logits_ss2 += TF.hflip(h_ss2)
-        logits_cd += TF.hflip(h_cd)
-        
-        # Vertical Flip Pass
-        v_ss1, v_ss2, v_cd, _ = self(TF.vflip(t1), TF.vflip(t2))
-        logits_ss1 += TF.vflip(v_ss1)
-        logits_ss2 += TF.vflip(v_ss2)
-        logits_cd += TF.vflip(v_cd)
-        
-        logits_ss1 /= 3.0
-        logits_ss2 /= 3.0
-        logits_cd /= 3.0
 
         loss, _ = self.criterion((logits_ss1, logits_ss2, logits_cd, logits_bd), (l1, l2, gt_cd, extract_boundary(gt_cd)))
         self.log('val_loss', loss, on_epoch=True, sync_dist=True)
@@ -154,8 +138,8 @@ def main():
     parser.add_argument('--dataset_name', type=str, default='SECOND')
     parser.add_argument('--model_type', type=str, default='convnextv2_base')
     parser.add_argument('--weights', type=str, default=None)
-    parser.add_argument('--batch_size', type=int, default=2) # Defaulted to 2 for GPU VRAM Safety
-    parser.add_argument('--accumulate_grad_batches', type=int, default=2) # Added Gradient Accumulation
+    parser.add_argument('--batch_size', type=int, default=2) 
+    parser.add_argument('--accumulate_grad_batches', type=int, default=4) # Bumped to 4 for larger effective batch size
     parser.add_argument('--epochs', type=int, default=100) 
     parser.add_argument('--freeze_epochs', type=int, default=5)
     parser.add_argument('--lr', type=float, default=1e-4) 
@@ -188,7 +172,8 @@ def main():
         strategy=strategy, 
         max_epochs=args.epochs, 
         precision=precision,
-        accumulate_grad_batches=args.accumulate_grad_batches, # [SOTA FIX] Prevents GPU OOM
+        accumulate_grad_batches=args.accumulate_grad_batches,
+        gradient_clip_val=1.0, # Added gradient clipping to stabilize OHEM spikes
         callbacks=[checkpoint_callback, CleanupCallback()], 
         enable_progress_bar=False, 
         logger=False, 
@@ -197,7 +182,7 @@ def main():
 
     if trainer.is_global_zero:
         eff_bs = args.batch_size * args.accumulate_grad_batches * (2 if args.accelerator == 'gpu' else 8)
-        print(f"\n🚀 BoundNeXt: {args.model_type.upper()} | Accel: {args.accelerator.upper()} | Eff. Batch: {eff_bs} | TemporalFusion: ON | TTA: ON | SCL: ON")
+        print(f"\n🚀 BoundNeXt: {args.model_type.upper()} | Accel: {args.accelerator.upper()} | Eff. Batch: {eff_bs} | TemporalFusion: ON | TTA: OFF | OHEM: ON")
     trainer.fit(model, train_loader, val_loader)
 
 if __name__ == '__main__':
