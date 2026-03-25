@@ -4,10 +4,6 @@ import torch.nn.functional as F
 from .backbone import SiameseConvNeXtV2
 from .modules import SC_UP_Module, BGI_Module, UWFF_Head
 
-# =====================================================================
-# [SOTA NOVELTY] Boundary-Conditioned Temporal Fusion (BCTF)
-# With FP16 Numerical Stability Patches for Mixed Precision Training
-# =====================================================================
 class BoundaryConditionedFusion(nn.Module):
     def __init__(self, in_channels, num_heads=8):
         super().__init__()
@@ -15,67 +11,54 @@ class BoundaryConditionedFusion(nn.Module):
         self.head_dim = in_channels // num_heads
         self.scale = self.head_dim ** -0.5
 
-        # [STABILITY FIX 1] Input Normalization to prevent variance explosion
         self.norm_in = nn.BatchNorm2d(in_channels * 2)
 
-        # Projects concatenated temporal features into Q, K, V
         self.qkv_conv = nn.Conv2d(in_channels * 2, in_channels * 3, kernel_size=1, bias=False)
         
-        # Projects the 1-channel boundary map into a spatial weighting matrix
         self.boundary_proj = nn.Sequential(
             nn.Conv2d(1, in_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(in_channels),
             nn.Sigmoid()
         )
         
-        # Output projection
         self.proj = nn.Conv2d(in_channels, in_channels, kernel_size=1)
         self.norm = nn.BatchNorm2d(in_channels)
         
-        # Local residual path to preserve smooth gradient flow
+        # Enhanced Local residual path with Depthwise Conv for high-freq structural preservation
         self.local_residual = nn.Sequential(
-            nn.Conv2d(in_channels * 2, in_channels, kernel_size=3, padding=1),
+            nn.Conv2d(in_channels * 2, in_channels * 2, kernel_size=3, padding=1, groups=in_channels * 2),
+            nn.Conv2d(in_channels * 2, in_channels, kernel_size=1),
             nn.BatchNorm2d(in_channels)
         )
 
     def forward(self, f1, f2, boundary_map):
         B, C, H, W = f1.shape
         
-        # 1. Prepare the Boundary Prior
         b_down = F.interpolate(boundary_map, size=(H, W), mode='bilinear', align_corners=False)
-        b_weight = self.boundary_proj(b_down) # Shape: [B, C, H, W]
+        b_weight = self.boundary_proj(b_down) 
         
-        # 2. Extract Q, K, V from temporal features
-        x = torch.cat([f1, f2], dim=1) # Shape: [B, 2C, H, W]
-        
-        # Apply Input Normalization
+        x = torch.cat([f1, f2], dim=1) 
         x_norm = self.norm_in(x)
         
-        qkv = self.qkv_conv(x_norm)    # Shape: [B, 3C, H, W]
-        q, k, v = qkv.chunk(3, dim=1)  # Each is [B, C, H, W]
+        qkv = self.qkv_conv(x_norm)   
+        q, k, v = qkv.chunk(3, dim=1)  
         
-        # 3. Condition Queries and Keys with the Boundary Prior
+        # Focus queries on boundary regions, and amplify retrieved values
         q = q * (1.0 + b_weight)
-        k = k * (1.0 + b_weight)
+        v = v * (1.0 + b_weight)
         
-        # 4. Reshape for Multi-Head Global Attention
         N = H * W
-        q = q.view(B, self.num_heads, self.head_dim, N).transpose(-2, -1) # [B, heads, N, head_dim]
-        k = k.view(B, self.num_heads, self.head_dim, N)                   # [B, heads, head_dim, N]
-        v = v.view(B, self.num_heads, self.head_dim, N).transpose(-2, -1) # [B, heads, N, head_dim]
+        q = q.view(B, self.num_heads, self.head_dim, N).transpose(-2, -1) 
+        k = k.view(B, self.num_heads, self.head_dim, N)                   
+        v = v.view(B, self.num_heads, self.head_dim, N).transpose(-2, -1) 
         
-        # 5. Calculate Edge-Aware Attention Matrix
-        # [STABILITY FIX 2] Apply scale to Q before matrix multiplication
         q = q * self.scale
         
-        # [STABILITY FIX 3] Upcast to FP32 purely for the Softmax calculation to prevent NaN
-        attn = (q.float() @ k.float()) # Output is temporarily float32
-        attn = attn.softmax(dim=-1).to(v.dtype) # Softmax applied safely, cast back to mixed precision
+        attn = (q.float() @ k.float()) 
+        attn = attn.softmax(dim=-1).to(v.dtype) 
         
-        # 6. Apply Attention to Values
-        out = (attn @ v).transpose(-2, -1).reshape(B, C, H, W) # [B, C, H, W]
+        out = (attn @ v).transpose(-2, -1).reshape(B, C, H, W)
         
-        # 7. Final Projection and Residual Fusion
         out = self.norm(self.proj(out))
         local_feat = self.local_residual(x)
         
@@ -98,7 +81,7 @@ class DecoderBlock(nn.Module):
         x = self.up(x)
         if skip is not None:
             if x.shape[2:] != skip.shape[2:]:
-                x = F.interpolate(x, size=skip.shape[2:], mode='bilinear')
+                x = F.interpolate(x, size=skip.shape[2:], mode='bilinear', align_corners=False)
             x = torch.cat([x, skip], dim=1)
         return self.conv(x)
 
@@ -114,13 +97,15 @@ class BoundNeXt(nn.Module):
         dims = self.encoder.dims 
         
         self.sc_up = SC_UP_Module(dims[3])
-        
-        # Initialize the Novel Boundary-Conditioned Fusion Block
         self.temporal_fusion = BoundaryConditionedFusion(in_channels=dims[3], num_heads=8)
         
+        # [SOTA FIX 1] Multi-Scale Boundary Head. Combines Stage 0 and Stage 1
+        # to ground the boundary map in semantics, preventing low-level noise interference.
         self.boundary_head = nn.Sequential(
-            nn.Conv2d(dims[0], 64, 3, padding=1),
-            nn.BatchNorm2d(64), nn.ReLU(),
+            nn.Conv2d(dims[0] + dims[1], 128, 3, padding=1),
+            nn.BatchNorm2d(128), nn.ReLU(inplace=True),
+            nn.Conv2d(128, 64, 3, padding=1),
+            nn.BatchNorm2d(64), nn.ReLU(inplace=True),
             nn.Conv2d(64, 1, 1)
         )
 
@@ -147,9 +132,12 @@ class BoundNeXt(nn.Module):
         
         f1_list, f2_list = self.encoder(t1, t2)
         
-        # 1. Generate Boundary Prior
-        diff_low = torch.abs(f1_list[0] - f2_list[0])
-        boundary_logits = self.boundary_head(diff_low)
+        # 1. Generate Multi-Scale Boundary Prior
+        diff_0 = torch.abs(f1_list[0] - f2_list[0])
+        diff_1 = torch.abs(f1_list[1] - f2_list[1])
+        diff_1_up = F.interpolate(diff_1, size=diff_0.shape[2:], mode='bilinear', align_corners=False)
+        
+        boundary_logits = self.boundary_head(torch.cat([diff_0, diff_1_up], dim=1))
         boundary_map = torch.sigmoid(boundary_logits)
         
         f1_3, f2_3 = self.sc_up(f1_list[3], f2_list[3])
@@ -174,9 +162,9 @@ class BoundNeXt(nn.Module):
         
         out_ss1, out_ss2, out_cd = self.head(x1, x2, cd_x)
         
-        out_ss1 = F.interpolate(out_ss1, size=img_size, mode='bilinear')
-        out_ss2 = F.interpolate(out_ss2, size=img_size, mode='bilinear')
-        out_cd = F.interpolate(out_cd, size=img_size, mode='bilinear')
-        out_bd = F.interpolate(boundary_logits, size=img_size, mode='bilinear')
+        out_ss1 = F.interpolate(out_ss1, size=img_size, mode='bilinear', align_corners=False)
+        out_ss2 = F.interpolate(out_ss2, size=img_size, mode='bilinear', align_corners=False)
+        out_cd = F.interpolate(out_cd, size=img_size, mode='bilinear', align_corners=False)
+        out_bd = F.interpolate(boundary_logits, size=img_size, mode='bilinear', align_corners=False)
         
         return out_ss1, out_ss2, out_cd, out_bd
