@@ -13,7 +13,7 @@ warnings.filterwarnings("ignore")
 logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
 
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint, Callback
+from pytorch_lightning.callbacks import ModelCheckpoint, Callback, EarlyStopping
 
 from boundmamba import BoundNeXt, BoundMambaLoss
 from boundmamba.utils import extract_boundary
@@ -89,9 +89,7 @@ class BoundNeXtLightning(pl.LightningModule):
         p_ss2 = torch.argmax(logits_ss2, dim=1)
         p_cd = (torch.sigmoid(logits_cd) > 0.5).long().squeeze(1)
         
-        # [SOTA FIX 4] Validation Symmetry 
-        # For unchanged pixels, use the combined ensemble confidence of BOTH networks
-        # rather than blindly overwriting ss2 with ss1.
+        # Validation Symmetry: Use the combined ensemble confidence for unchanged pixels
         logits_shared = logits_ss1 + logits_ss2
         p_shared = torch.argmax(logits_shared, dim=1)
         
@@ -112,6 +110,8 @@ class BoundNeXtLightning(pl.LightningModule):
 
         self.metrics.hist_sem1, self.metrics.hist_sem2, self.metrics.hist_bcd = h1_t.cpu().numpy(), h2_t.cpu().numpy(), hb_t.cpu().numpy()
         self.last_val_metrics = self.metrics.compute()
+        
+        # Log val_score to be monitored by EarlyStopping and ModelCheckpoint
         self.log('val_score', self.last_val_metrics['score'], sync_dist=False, rank_zero_only=True)
         self.metrics.reset()
 
@@ -146,8 +146,9 @@ def main():
     parser.add_argument('--batch_size', type=int, default=2) 
     parser.add_argument('--accumulate_grad_batches', type=int, default=4) 
     parser.add_argument('--epochs', type=int, default=100) 
-    parser.add_argument('--freeze_epochs', type=int, default=5) # Reduced back to 5, 10 is too long for ConvNeXt
+    parser.add_argument('--freeze_epochs', type=int, default=5)
     parser.add_argument('--lr', type=float, default=1e-4) 
+    parser.add_argument('--patience', type=int, default=15, help='Patience for early stopping')
     parser.add_argument('--save_dir', type=str, default='/kaggle/working/checkpoints')
     parser.add_argument('--seed', type=int, default=42)
     
@@ -164,7 +165,26 @@ def main():
                             batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=False)
 
     model = BoundNeXtLightning(args)
-    checkpoint_callback = ModelCheckpoint(dirpath=args.save_dir, monitor="val_score", mode="max", save_top_k=1, save_last=False, filename="best_model", save_weights_only=True)
+    
+    # Checkpointing to save the best model based on val_score
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=args.save_dir, 
+        monitor="val_score", 
+        mode="max", 
+        save_top_k=1, 
+        save_last=False, 
+        filename="best_model", 
+        save_weights_only=True
+    )
+    
+    # Early Stopping to halt training if val_score plateaus
+    early_stop_callback = EarlyStopping(
+        monitor="val_score",
+        min_delta=0.0001,
+        patience=args.patience,
+        verbose=False, # Lightning prints anyway, set True if you want extra verbosity
+        mode="max"
+    )
 
     strategy = "ddp_find_unused_parameters_true" if args.accelerator == 'gpu' else "auto"
     devices = int(args.devices) if args.devices.isdigit() else args.devices
@@ -179,7 +199,7 @@ def main():
         precision=precision,
         accumulate_grad_batches=args.accumulate_grad_batches,
         gradient_clip_val=1.0, 
-        callbacks=[checkpoint_callback, CleanupCallback()], 
+        callbacks=[checkpoint_callback, early_stop_callback, CleanupCallback()], 
         enable_progress_bar=False, 
         logger=False, 
         sync_batchnorm=sync_bn
@@ -188,6 +208,8 @@ def main():
     if trainer.is_global_zero:
         eff_bs = args.batch_size * args.accumulate_grad_batches * (2 if args.accelerator == 'gpu' else 8)
         print(f"\n🚀 BoundNeXt: {args.model_type.upper()} | Accel: {args.accelerator.upper()} | Eff. Batch: {eff_bs} | Dual-Phase Task Interaction: ON")
+        print(f"🛑 Early Stopping: ON (Patience: {args.patience} Epochs)")
+    
     trainer.fit(model, train_loader, val_loader)
 
 if __name__ == '__main__':
