@@ -8,35 +8,19 @@ import torchvision.transforms.functional as TF
 from torchvision import transforms
 from PIL import Image
 
-# Import the centralized normalization logic
 from utils import normalization_utils as norm_utils
 
-# ==============================================================================
-# DATASET CONFIGURATIONS
-# ==============================================================================
-
-# --- SECOND Dataset Config ---
 ST_NUM_CLASSES = 7
 ST_CLASSES = ['unchanged', 'water', 'ground', 'low vegetation', 'tree', 'building', 'sports field']
 ST_COLORMAP = [
-    [255, 255, 255], # Unchanged
-    [0, 0, 255],     # Water
-    [128, 128, 128], # Ground
-    [0, 128, 0],     # Low Vegetation
-    [0, 255, 0],     # Tree
-    [128, 0, 0],     # Building
-    [255, 0, 0]      # Sports Field
+    [255, 255, 255], [0, 0, 255], [128, 128, 128], [0, 128, 0], 
+    [0, 255, 0], [128, 0, 0], [255, 0, 0]
 ]
 
-# --- LandsatSCD Dataset Config ---
 LANDSAT_NUM_CLASSES = 5
 LANDSAT_CLASSES = ['No change', 'Farmland', 'Desert', 'Building', 'Water']
 LANDSAT_COLORMAP = [
-    [255, 255, 255], # 0: No change
-    [0, 155, 0],     # 1: Farmland
-    [255, 165, 0],   # 2: Desert
-    [230, 30, 100],  # 3: Building
-    [0, 170, 240]    # 4: Water
+    [255, 255, 255], [0, 155, 0], [255, 165, 0], [230, 30, 100], [0, 170, 240]
 ]
 
 def build_colormap_lookup(colormap):
@@ -46,12 +30,11 @@ def build_colormap_lookup(colormap):
         lookup[idx] = i
     return lookup
 
-# Pre-calculate lookup tables
 st_colormap2label = build_colormap_lookup(ST_COLORMAP)
 landsat_colormap2label = build_colormap_lookup(LANDSAT_COLORMAP)
 
 def Color2Index(ColorLabel, lookup_table, num_classes):
-    if len(ColorLabel.shape) == 2: # Already grayscale/index
+    if len(ColorLabel.shape) == 2: 
         return ColorLabel
         
     data = ColorLabel.astype(np.int32)
@@ -62,12 +45,7 @@ def Color2Index(ColorLabel, lookup_table, num_classes):
     
     return IndexMap.astype(np.int64)
 
-# ==============================================================================
-# Main Dataset Class
-# ==============================================================================
-
 class SCDDataset(data.Dataset):
-    # SOTA FIX: Forced random_flip and random_swap to True by default for train
     def __init__(self, root, mode, dataset_name='SECOND', patch_mode=True, random_flip=True, random_swap=True):
         self.root = root
         self.mode = mode
@@ -94,35 +72,21 @@ class SCDDataset(data.Dataset):
         self.dir_sem1 = os.path.join(base_path, 'labelA_rgb')
         self.dir_sem2 = os.path.join(base_path, 'labelB_rgb')
         self.dir_bcd = os.path.join(base_path, 'label_bcd')
-        
-        for d in [self.dir_A, self.dir_B, self.dir_sem1, self.dir_sem2, self.dir_bcd]:
-            if not os.path.exists(d):
-                raise FileNotFoundError(f"Directory not found: {d}")
 
         self.file_list = self._get_valid_file_list()
         print(f"[{dataset_name}] {mode} set loaded. Found {len(self.file_list)} samples (Patch Mode: {patch_mode}).")
 
-        # Augmentations
         self.color_jitter = transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1)
-        self.grayscale = transforms.RandomGrayscale(p=0.2)
         self.gaussian_blur = transforms.GaussianBlur(kernel_size=(5, 9), sigma=(0.1, 5))
 
     def _get_valid_file_list(self):
         files = [f for f in os.listdir(self.dir_A) if f.lower().endswith(('.png', '.jpg', '.tif', '.bmp'))]
         valid_items = []
-        
         for f in files:
-            if (os.path.exists(os.path.join(self.dir_B, f)) and
-                os.path.exists(os.path.join(self.dir_sem1, f)) and 
-                os.path.exists(os.path.join(self.dir_sem2, f)) and
-                os.path.exists(os.path.join(self.dir_bcd, f))):
-                
-                if self.patch_mode:
-                    for i in range(4):
-                        valid_items.append((f, i))
-                else:
-                    valid_items.append((f, -1))
-                    
+            if self.patch_mode:
+                for i in range(4): valid_items.append((f, i))
+            else:
+                valid_items.append((f, -1))
         return valid_items
 
     def _get_patch(self, img, patch_idx, crop_size=256):
@@ -134,17 +98,12 @@ class SCDDataset(data.Dataset):
         else: return img
 
     def _sync_transform(self, img_A, img_B, sem1, sem2, bcd):
-        # 1. Random Resized Crop
-        if random.random() < 0.5:
-            w_orig, h_orig = img_A.size
-            i, j, h, w = transforms.RandomResizedCrop.get_params(img_A, scale=(0.5, 1.0), ratio=(0.75, 1.33))
-            img_A = TF.resized_crop(img_A, i, j, h, w, (h_orig, w_orig), interpolation=transforms.InterpolationMode.BILINEAR)
-            img_B = TF.resized_crop(img_B, i, j, h, w, (h_orig, w_orig), interpolation=transforms.InterpolationMode.BILINEAR)
-            sem1 = TF.resized_crop(sem1, i, j, h, w, (h_orig, w_orig), interpolation=transforms.InterpolationMode.NEAREST)
-            sem2 = TF.resized_crop(sem2, i, j, h, w, (h_orig, w_orig), interpolation=transforms.InterpolationMode.NEAREST)
-            bcd = TF.resized_crop(bcd, i, j, h, w, (h_orig, w_orig), interpolation=transforms.InterpolationMode.NEAREST)
-
-        # 2. Flips
+        # [SOTA FIX 2] Removed Destructive RandomResizedCrop
+        # Resizing segmentation masks with NEAREST interpolation creates jagged, stair-step 
+        # boundaries that completely destroy the boundary learning objective (gt_bd).
+        # We rely strictly on non-destructive spatial and color transforms.
+        
+        # 1. Flips
         if self.random_flip:
             if random.random() > 0.5:
                 img_A = TF.hflip(img_A); img_B = TF.hflip(img_B)
@@ -155,13 +114,12 @@ class SCDDataset(data.Dataset):
             
             # Rotations
             if random.random() > 0.5:
-                rotations = [0, 90, 180, 270]
-                angle = random.choice(rotations)
+                angle = random.choice([0, 90, 180, 270])
                 if angle > 0:
                     img_A = TF.rotate(img_A, angle); img_B = TF.rotate(img_B, angle)
                     sem1 = TF.rotate(sem1, angle); sem2 = TF.rotate(sem2, angle); bcd = TF.rotate(bcd, angle)
 
-        # 3. Color & Blur
+        # 2. Color & Blur
         if random.random() < 0.8: img_A = self.color_jitter(img_A)
         if random.random() < 0.8: img_B = self.color_jitter(img_B)
         if random.random() < 0.5: img_A = self.gaussian_blur(img_A)
@@ -206,8 +164,6 @@ class SCDDataset(data.Dataset):
 
         if self.mode == 'train':
             p_img_A, p_img_B, p_sem1, p_sem2, p_bcd = self._sync_transform(p_img_A, p_img_B, p_sem1, p_sem2, p_bcd)
-            
-            # SOTA FIX: Temporal Swap helps the model learn transition bi-directionally
             if self.random_swap and random.random() > 0.5:
                 p_img_A, p_img_B = p_img_B, p_img_A
                 p_sem1, p_sem2 = p_sem2, p_sem1
