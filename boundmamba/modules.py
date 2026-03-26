@@ -35,7 +35,6 @@ class SC_UP_Module(nn.Module):
     def __init__(self, in_channels):
         super().__init__()
         mid_ch = in_channels // 2
-        # SOTA Update: Inject ASPP for multi-scale context
         self.aspp1 = ASPP(in_channels, mid_ch)
         self.aspp2 = ASPP(in_channels, mid_ch)
         
@@ -48,49 +47,84 @@ class SC_UP_Module(nn.Module):
         self.proj2 = nn.Conv2d(mid_ch, in_channels, 1)
 
     def forward(self, f1, f2):
-        # Extract global context
         f1_ctx = self.aspp1(f1)
         f2_ctx = self.aspp2(f2)
         
-        # Correlation
         concat = torch.cat([f1_ctx, f2_ctx], dim=1)
         corr = self.corr_conv(concat)
         
-        # Unchanged Prior Suppression
         f1_out = f1 + self.proj1(f1_ctx * corr)
         f2_out = f2 + self.proj2(f2_ctx * corr)
         
         return f1_out, f2_out
 
 class BGI_Module(nn.Module):
+    """
+    [SOTA FIX 1] Dual-Phase Task Interaction.
+    Previously, this module only fused x1 and x2 into the Change stream (cd).
+    Now, it projects the Change stream BACK into the Semantic streams (x1, x2)
+    so the semantic decoders know exactly where the changes are.
+    """
     def __init__(self, in_channels):
         super().__init__()
         self.spatial_gate = nn.Sequential(
             nn.Conv2d(1, 16, 3, padding=1),
-            nn.BatchNorm2d(16), nn.ReLU(),
+            nn.BatchNorm2d(16), nn.ReLU(inplace=True),
             nn.Conv2d(16, 1, 1),
             nn.Sigmoid()
         )
-        self.fusion = nn.Sequential(
+        self.cd_fusion = nn.Sequential(
             nn.Conv2d(in_channels * 3, in_channels, 3, padding=1),
-            nn.BatchNorm2d(in_channels), nn.ReLU()
+            nn.BatchNorm2d(in_channels), nn.ReLU(inplace=True)
+        )
+        # Injection paths for semantics
+        self.ss1_fusion = nn.Sequential(
+            nn.Conv2d(in_channels * 2, in_channels, 3, padding=1),
+            nn.BatchNorm2d(in_channels), nn.ReLU(inplace=True)
+        )
+        self.ss2_fusion = nn.Sequential(
+            nn.Conv2d(in_channels * 2, in_channels, 3, padding=1),
+            nn.BatchNorm2d(in_channels), nn.ReLU(inplace=True)
         )
 
     def forward(self, x1, x2, cd, bd_map):
         if bd_map.shape[2:] != cd.shape[2:]:
-            bd_map = F.interpolate(bd_map, size=cd.shape[2:], mode='bilinear')
+            bd_map = F.interpolate(bd_map, size=cd.shape[2:], mode='bilinear', align_corners=False)
         
         gate = self.spatial_gate(bd_map)
         cd_sharpened = cd * (1 + gate)
         
-        return self.fusion(torch.cat([x1, x2, cd_sharpened], dim=1))
+        # 1. Fuse into CD
+        cd_out = self.cd_fusion(torch.cat([x1, x2, cd_sharpened], dim=1))
+        
+        # 2. Inject CD back into Semantics
+        x1_out = self.ss1_fusion(torch.cat([x1, cd_out], dim=1))
+        x2_out = self.ss2_fusion(torch.cat([x2, cd_out], dim=1))
+        
+        return x1_out, x2_out, cd_out
 
 class UWFF_Head(nn.Module):
+    """
+    [SOTA FIX 3] Stronger Output Classifier.
+    Replaced weak 1x1 Convs with 3x3 Context blocks to prevent salt-and-pepper fragmentation.
+    """
     def __init__(self, in_channels, num_classes):
         super().__init__()
-        self.ss1_head = nn.Conv2d(in_channels, num_classes, 1)
-        self.ss2_head = nn.Conv2d(in_channels, num_classes, 1)
-        self.cd_head = nn.Conv2d(in_channels, 1, 1)
+        self.ss1_head = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, 3, padding=1),
+            nn.BatchNorm2d(in_channels), nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, num_classes, 1)
+        )
+        self.ss2_head = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, 3, padding=1),
+            nn.BatchNorm2d(in_channels), nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, num_classes, 1)
+        )
+        self.cd_head = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, 3, padding=1),
+            nn.BatchNorm2d(in_channels), nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels, 1, 1)
+        )
 
     def forward(self, x1, x2, cd_f):
         return self.ss1_head(x1), self.ss2_head(x2), self.cd_head(cd_f)
