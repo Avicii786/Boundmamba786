@@ -81,10 +81,7 @@ class BoundNeXtLightning(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         t1, t2, l1, l2, gt_cd = batch['img_A'], batch['img_B'], batch['sem1'], batch['sem2'], batch['bcd']
         
-        # [SOTA FIX 4] Removed TTA from Validation Loop. 
-        # TTA artificially inflates metrics during training and destroys accurate V-Loss tracking.
         logits_ss1, logits_ss2, logits_cd, logits_bd = self(t1, t2)
-
         loss, _ = self.criterion((logits_ss1, logits_ss2, logits_cd, logits_bd), (l1, l2, gt_cd, extract_boundary(gt_cd)))
         self.log('val_loss', loss, on_epoch=True, sync_dist=True)
         
@@ -92,7 +89,15 @@ class BoundNeXtLightning(pl.LightningModule):
         p_ss2 = torch.argmax(logits_ss2, dim=1)
         p_cd = (torch.sigmoid(logits_cd) > 0.5).long().squeeze(1)
         
-        p_ss2 = torch.where(p_cd == 0, p_ss1, p_ss2)
+        # [SOTA FIX 4] Validation Symmetry 
+        # For unchanged pixels, use the combined ensemble confidence of BOTH networks
+        # rather than blindly overwriting ss2 with ss1.
+        logits_shared = logits_ss1 + logits_ss2
+        p_shared = torch.argmax(logits_shared, dim=1)
+        
+        p_ss1 = torch.where(p_cd == 0, p_shared, p_ss1)
+        p_ss2 = torch.where(p_cd == 0, p_shared, p_ss2)
+        
         self.metrics.update(p_ss1, p_ss2, p_cd, l1, l2, gt_cd)
 
     def on_validation_epoch_end(self):
@@ -139,9 +144,9 @@ def main():
     parser.add_argument('--model_type', type=str, default='convnextv2_base')
     parser.add_argument('--weights', type=str, default=None)
     parser.add_argument('--batch_size', type=int, default=2) 
-    parser.add_argument('--accumulate_grad_batches', type=int, default=4) # Bumped to 4 for larger effective batch size
+    parser.add_argument('--accumulate_grad_batches', type=int, default=4) 
     parser.add_argument('--epochs', type=int, default=100) 
-    parser.add_argument('--freeze_epochs', type=int, default=5)
+    parser.add_argument('--freeze_epochs', type=int, default=5) # Reduced back to 5, 10 is too long for ConvNeXt
     parser.add_argument('--lr', type=float, default=1e-4) 
     parser.add_argument('--save_dir', type=str, default='/kaggle/working/checkpoints')
     parser.add_argument('--seed', type=int, default=42)
@@ -173,7 +178,7 @@ def main():
         max_epochs=args.epochs, 
         precision=precision,
         accumulate_grad_batches=args.accumulate_grad_batches,
-        gradient_clip_val=1.0, # Added gradient clipping to stabilize OHEM spikes
+        gradient_clip_val=1.0, 
         callbacks=[checkpoint_callback, CleanupCallback()], 
         enable_progress_bar=False, 
         logger=False, 
@@ -182,7 +187,7 @@ def main():
 
     if trainer.is_global_zero:
         eff_bs = args.batch_size * args.accumulate_grad_batches * (2 if args.accelerator == 'gpu' else 8)
-        print(f"\n🚀 BoundNeXt: {args.model_type.upper()} | Accel: {args.accelerator.upper()} | Eff. Batch: {eff_bs} | TemporalFusion: ON | TTA: OFF | OHEM: ON")
+        print(f"\n🚀 BoundNeXt: {args.model_type.upper()} | Accel: {args.accelerator.upper()} | Eff. Batch: {eff_bs} | Dual-Phase Task Interaction: ON")
     trainer.fit(model, train_loader, val_loader)
 
 if __name__ == '__main__':
