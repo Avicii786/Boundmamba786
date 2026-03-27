@@ -36,9 +36,35 @@ Your UWFF_Head uses a single 1x1 Conv to project from the decoder features direc
 4. Validation Asymmetry (train.py)
 During validation, you do: p_ss2 = torch.where(p_cd == 0, p_ss1, p_ss2). This forces ss2 to match ss1 in unchanged regions. But what if ss2 was right and ss1 was wrong? You are blindly overriding it. Fix: We must calculate the combined ensemble confidence (logits_ss1 + logits_ss2), find the most confident class, and apply that to both outputs for unchanged regions.
 
-- Result after 70 epochs (Early stopped at)
+- Result after 70 epochs (Early stopped at 44 Epoch)
 
 --------------------------------------------------------------------------------------------------------------
 |  T-Loss  |  S-Loss  |  B-Loss  |  V-Loss  |   SeK   | F1-BCD  |  mIoU   |  Score 
 	--------------------------------------------------------------------------------------------------------------
+												21.32%	71.6%		70.83%
+
+
+### 3. Changes Made
+
+We are now at ~71% mIoU / 21.3% SeK. To bridge the final gap to 73% mIoU / 23% SeK, we have to address the remaining mathematical bottlenecks holding us back:
+
+- A. The Razor-Thin Boundary Problem (utils.py)
+Your F1-BCD (Binary Change F1) dropped slightly and is hovering around 71.6%. Why? Look at your extract_boundary function. You use a 3x3 kernel. On a dense image, a 3x3 morphological gradient creates a boundary that is exactly 1 pixel thick. It is mathematically brutal to ask a deep CNN to perfectly align a 1-pixel line. The Dice Loss gradients become incredibly sparse and erratic when the model misses by just a fraction of a pixel.
+
+- The Fix: We need to thicken the boundary to a 5x5 kernel. This creates a "boundary ribbon" (2-3 pixels thick). It gives the network a softer, more forgiving target to learn structural edges, drastically improving F1-BCD.
+
+- B. The Learning Rate Trap (train.py)
+You are using CosineAnnealingLR(T_max=100). This scheduler assumes you will train for exactly 100 epochs, slowly lowering the learning rate. Because our model is plateauing and stopping early around Epoch 40, the learning rate is still much too high when the model needs to do fine-grained optimization. It's taking massive steps right as it reaches the bottom of the loss landscape, causing those oscillations.
+
+- The Fix: Switch to ReduceLROnPlateau. If the val_score stops improving for 5 epochs, we slash the learning rate by 50%. This allows the model to "settle" into the exact mathematical minimum to squeeze out that final 2-3% mIoU.
+
+- C. Safe Scale Diversity (dataset.py)
+When we removed RandomResizedCrop to stop jagged edges, we lost scale invariance (the ability to recognize big and small buildings equally well).
+
+- The Fix: We will add RandomAffine scaling. Affine transformations interpolate the image globally rather than aggressively cutting and stretching it, preserving boundary smoothness while giving us scale diversity.
+
+
+--------------------------------------------------------------------------------------------------------------
+|  T-Loss  |  S-Loss  |  B-Loss  |  V-Loss  |   SeK   | F1-BCD  |  mIoU   |  Score 
+--------------------------------------------------------------------------------------------------------------
 
