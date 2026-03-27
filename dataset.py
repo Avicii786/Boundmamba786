@@ -98,11 +98,19 @@ class SCDDataset(data.Dataset):
         else: return img
 
     def _sync_transform(self, img_A, img_B, sem1, sem2, bcd):
-        # [SOTA FIX 2] Removed Destructive RandomResizedCrop
-        # Resizing segmentation masks with NEAREST interpolation creates jagged, stair-step 
-        # boundaries that completely destroy the boundary learning objective (gt_bd).
-        # We rely strictly on non-destructive spatial and color transforms.
-        
+        # [SOTA FIX 3] Re-introduced Scale Invariance safely.
+        # Instead of destructive RandomResizedCrop, we use Affine scaling.
+        # This prevents jagged edges on the masks while still forcing the model 
+        # to learn large and small features robustly.
+        if random.random() > 0.5:
+            scale_factor = random.uniform(0.8, 1.2)
+            # Affine requires center and angle, angle=0 to isolate scaling
+            img_A = TF.affine(img_A, angle=0, translate=(0,0), scale=scale_factor, shear=0, interpolation=transforms.InterpolationMode.BILINEAR)
+            img_B = TF.affine(img_B, angle=0, translate=(0,0), scale=scale_factor, shear=0, interpolation=transforms.InterpolationMode.BILINEAR)
+            sem1 = TF.affine(sem1, angle=0, translate=(0,0), scale=scale_factor, shear=0, interpolation=transforms.InterpolationMode.NEAREST)
+            sem2 = TF.affine(sem2, angle=0, translate=(0,0), scale=scale_factor, shear=0, interpolation=transforms.InterpolationMode.NEAREST)
+            bcd = TF.affine(bcd, angle=0, translate=(0,0), scale=scale_factor, shear=0, interpolation=transforms.InterpolationMode.NEAREST)
+
         # 1. Flips
         if self.random_flip:
             if random.random() > 0.5:
