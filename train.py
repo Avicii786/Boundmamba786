@@ -148,7 +148,7 @@ def main():
     parser.add_argument('--epochs', type=int, default=100) 
     parser.add_argument('--freeze_epochs', type=int, default=5)
     parser.add_argument('--lr', type=float, default=1e-4) 
-    parser.add_argument('--patience', type=int, default=20, help='Patience for early stopping')
+    parser.add_argument('--patience', type=int, default=15, help='Patience for early stopping')
     parser.add_argument('--save_dir', type=str, default='/kaggle/working/checkpoints')
     parser.add_argument('--seed', type=int, default=42)
     
