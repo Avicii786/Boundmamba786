@@ -194,7 +194,8 @@ def main():
     trainer = pl.Trainer(
         accelerator=args.accelerator, 
         devices=devices, 
-        strategy=strategy, 
+        strategy=strategy,
+        min_epochs = 50
         max_epochs=args.epochs, 
         precision=precision,
         accumulate_grad_batches=args.accumulate_grad_batches,
