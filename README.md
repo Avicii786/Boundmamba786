@@ -37,6 +37,7 @@ Your UWFF_Head uses a single 1x1 Conv to project from the decoder features direc
 During validation, you do: p_ss2 = torch.where(p_cd == 0, p_ss1, p_ss2). This forces ss2 to match ss1 in unchanged regions. But what if ss2 was right and ss1 was wrong? You are blindly overriding it. Fix: We must calculate the combined ensemble confidence (logits_ss1 + logits_ss2), find the most confident class, and apply that to both outputs for unchanged regions.
 
 - Result after 70 epochs (Early stopped at 44 Epoch)
+- V29 on Kaggle
 
 SEK = 21.32%	
 F1_BCD = 71.6%		
@@ -65,7 +66,32 @@ When we removed RandomResizedCrop to stop jagged edges, we lost scale invariance
 - The Fix: We will add RandomAffine scaling. Affine transformations interpolate the image globally rather than aggressively cutting and stretching it, preserving boundary smoothness while giving us scale diversity.
 
 
---------------------------------------------------------------------------------------------------------------
-|  T-Loss  |  S-Loss  |  B-Loss  |  V-Loss  |   SeK   | F1-BCD  |  mIoU   |  Score 
---------------------------------------------------------------------------------------------------------------
+- Result after 70 epochs (Early stopped at 66 Epoch)
+- V30 on Kaggle
+`Result`
+SEK = 21.67%
+F1_BCD = 71.95%
+mIOU = 70.96%
+
+
+### 4. Changes Made
+
+The Diagnosis: Why did it stop at ~71% instead of 73%?
+Look closely at Epochs 51 through 66. The ReduceLROnPlateau scheduler absolutely triggered (slashing the learning rate), but the validation loss (V-Loss) barely moved, and the score just hovered around 0.3630.
+
+When you slash the learning rate and the model still can't optimize the final 2%, it means you are suffering from Vanishing Gradients in the Skip Connections.
+
+I have analyzed model.py and found the two final architectural flaws keeping us from 73% mIoU:
+
+A. The Mono-Temporal Skip Flaw
+At the bottom of your network (Stage 3), you use BoundaryConditionedFusion to mix temporal features. However, as the network decodes upwards, the skip connections (f1_list[2], f1_list[1]) you pass into the decoders are entirely mono-temporal (they only see Image A or Image B, not the difference). The high-resolution decoders are trying to reconstruct the exact change boundaries while completely blind to the other temporal image!
+
+B. Gradient Starvation (Lack of Deep Supervision)
+You only calculate the loss at the very end of the network (out_ss1, out_ss2). By the time the gradients travel all the way back up the decoders to fine-tune the mid-level ConvNeXt features, they are nearly dead.
+
+🛠️ The Final SOTA Fixes
+Change-Aware Skip Connections: We will inject the absolute temporal difference (torch.abs(f1_list[i] - f2_list[i])) directly into the skip connections. This explicitly highlights "what changed" at every single spatial resolution.
+
+Deep Supervision (Auxiliary Head): We will attach an auxiliary classifier to Stage 2 of the decoder. During training, we will calculate the loss at Stage 2 and Stage 1. This injects massive, fresh gradients directly into the middle of the network, forcing it to learn rich semantics earlier.
+
 
