@@ -195,7 +195,7 @@ def main():
         accelerator=args.accelerator, 
         devices=devices, 
         strategy=strategy,
-        min_epochs = 50
+        min_epochs = 50,
         max_epochs=args.epochs, 
         precision=precision,
         accumulate_grad_batches=args.accumulate_grad_batches,
