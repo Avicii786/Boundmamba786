@@ -70,8 +70,20 @@ class BoundNeXtLightning(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         t1, t2, l1, l2, gt_cd = batch['img_A'], batch['img_B'], batch['sem1'], batch['sem2'], batch['bcd']
         gt_bd = extract_boundary(gt_cd)
-        pred_ss1, pred_ss2, pred_cd, pred_bd = self(t1, t2)
-        loss, loss_dict = self.criterion((pred_ss1, pred_ss2, pred_cd, pred_bd), (l1, l2, gt_cd, gt_bd))
+        
+        # [THE FIX] Model now returns 2 elements: Main Outputs and Aux Outputs
+        outputs, aux_outputs = self(t1, t2)
+        pred_ss1, pred_ss2, pred_cd, pred_bd = outputs
+        
+        # 1. Main Loss
+        loss_main, loss_dict = self.criterion(outputs, (l1, l2, gt_cd, gt_bd))
+        
+        # 2. Deep Supervision Loss (Auxiliary)
+        # We reuse pred_bd for the boundary loss since aux_head doesn't predict boundaries
+        loss_aux, _ = self.criterion((aux_outputs[0], aux_outputs[1], aux_outputs[2], pred_bd), (l1, l2, gt_cd, gt_bd))
+        
+        # Combined Loss with 0.4 Aux Weight
+        loss = loss_main + (0.4 * loss_aux)
         
         self.log('t_loss', loss, on_step=False, on_epoch=True, sync_dist=True)
         self.log('s_loss', loss_dict['ss'], on_step=False, on_epoch=True, sync_dist=True)
@@ -81,6 +93,7 @@ class BoundNeXtLightning(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         t1, t2, l1, l2, gt_cd = batch['img_A'], batch['img_B'], batch['sem1'], batch['sem2'], batch['bcd']
         
+        # Validation only returns the main outputs (because model.training == False)
         logits_ss1, logits_ss2, logits_cd, logits_bd = self(t1, t2)
         loss, _ = self.criterion((logits_ss1, logits_ss2, logits_cd, logits_bd), (l1, l2, gt_cd, extract_boundary(gt_cd)))
         self.log('val_loss', loss, on_epoch=True, sync_dist=True)
@@ -89,7 +102,6 @@ class BoundNeXtLightning(pl.LightningModule):
         p_ss2 = torch.argmax(logits_ss2, dim=1)
         p_cd = (torch.sigmoid(logits_cd) > 0.5).long().squeeze(1)
         
-        # Validation Symmetry: Use the combined ensemble confidence for unchanged pixels
         logits_shared = logits_ss1 + logits_ss2
         p_shared = torch.argmax(logits_shared, dim=1)
         
@@ -111,7 +123,6 @@ class BoundNeXtLightning(pl.LightningModule):
         self.metrics.hist_sem1, self.metrics.hist_sem2, self.metrics.hist_bcd = h1_t.cpu().numpy(), h2_t.cpu().numpy(), hb_t.cpu().numpy()
         self.last_val_metrics = self.metrics.compute()
         
-        # Log val_score to be monitored by EarlyStopping and ModelCheckpoint
         self.log('val_score', self.last_val_metrics['score'], sync_dist=False, rank_zero_only=True)
         self.metrics.reset()
 
@@ -134,8 +145,18 @@ class BoundNeXtLightning(pl.LightningModule):
             {'params': decoder_params, 'lr': self.args.lr}
         ], weight_decay=0.05)
         
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.args.epochs, eta_min=1e-6)
-        return [optimizer], [scheduler]
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='max', factor=0.5, patience=5, min_lr=1e-6, verbose=False
+        )
+        
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "val_score",
+                "frequency": 1
+            }
+        }
 
 def main():
     parser = argparse.ArgumentParser()
@@ -166,7 +187,6 @@ def main():
 
     model = BoundNeXtLightning(args)
     
-    # Checkpointing to save the best model based on val_score
     checkpoint_callback = ModelCheckpoint(
         dirpath=args.save_dir, 
         monitor="val_score", 
@@ -177,12 +197,11 @@ def main():
         save_weights_only=True
     )
     
-    # Early Stopping to halt training if val_score plateaus
     early_stop_callback = EarlyStopping(
         monitor="val_score",
         min_delta=0.0001,
         patience=args.patience,
-        verbose=False, # Lightning prints anyway, set True if you want extra verbosity
+        verbose=False, 
         mode="max"
     )
 
@@ -208,7 +227,7 @@ def main():
 
     if trainer.is_global_zero:
         eff_bs = args.batch_size * args.accumulate_grad_batches * (2 if args.accelerator == 'gpu' else 8)
-        print(f"\n🚀 BoundNeXt: {args.model_type.upper()} | Accel: {args.accelerator.upper()} | Eff. Batch: {eff_bs} | Dual-Phase Task Interaction: ON")
+        print(f"\n🚀 BoundNeXt: {args.model_type.upper()} | Accel: {args.accelerator.upper()} | Eff. Batch: {eff_bs} | Deep Supervision: ON | Change-Aware Skips: ON")
         print(f"🛑 Early Stopping: ON (Patience: {args.patience} Epochs)")
     
     trainer.fit(model, train_loader, val_loader)
