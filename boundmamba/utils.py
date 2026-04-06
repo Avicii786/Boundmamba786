@@ -2,29 +2,43 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 
-def extract_boundary(mask, kernel_size=5):
+def _get_categorical_boundary(mask, kernel_size=5):
     """
-    [SOTA FIX 1] Boundary Thickening.
-    Increased kernel from 3x3 to 5x5 to create a 'boundary ribbon'.
-    A 1-pixel thick boundary is too sparse for Dice Loss to optimize effectively.
-    A thicker boundary gives the model a softer target to guide the BCTF attention.
+    Uses Max/Min Pooling as morphological Dilation/Erosion.
+    This safely extracts structural edges from BOTH binary and multi-class maps
+    without doing meaningless arithmetic on categorical labels.
     """
     if mask.dim() == 3:
         mask = mask.unsqueeze(1) # [B, 1, H, W]
     
     mask = mask.float()
-    kernel = torch.ones(1, 1, kernel_size, kernel_size, device=mask.device)
     padding = kernel_size // 2
     
-    # Dilation
-    dilation = (F.conv2d(mask, kernel, padding=padding) > 0).float()
+    # Max-pool acts as morphological dilation
+    dilation = F.max_pool2d(mask, kernel_size, stride=1, padding=padding)
     
-    # Erosion (using inverse dilation)
-    erosion = 1.0 - (F.conv2d(1.0 - mask, kernel, padding=padding) > 0).float()
+    # Min-pool acts as morphological erosion (achieved via negating the mask)
+    erosion = -F.max_pool2d(-mask, kernel_size, stride=1, padding=padding)
     
-    # Boundary = Dilation - Erosion
-    boundary = dilation - erosion
+    # Where max != min, there is a semantic class transition (a boundary)
+    boundary = (dilation != erosion).float()
     return boundary.squeeze(1)
+
+def extract_composite_boundary(gt_cd, sem1, sem2, kernel_size=5):
+    """
+    [SOTA FIX 5] Composite Boundary Extraction.
+    Extracts thick (5x5) boundaries not just from the change mask, but also from the 
+    semantic structures of T1 and T2. This forces the Boundary Head to learn 
+    the intra-image edges (e.g., building vs. road) even if they didn't change.
+    """
+    bd_cd = _get_categorical_boundary(gt_cd, kernel_size)
+    bd_sem1 = _get_categorical_boundary(sem1, kernel_size)
+    bd_sem2 = _get_categorical_boundary(sem2, kernel_size)
+    
+    # Logical OR: A pixel is a boundary if it's a change edge, T1 edge, OR T2 edge.
+    composite_bd = torch.clamp(bd_cd + bd_sem1 + bd_sem2, 0.0, 1.0)
+    
+    return composite_bd
 
 def calculate_metrics(pred_cd, gt_cd):
     probs = torch.sigmoid(pred_cd).squeeze(1)
