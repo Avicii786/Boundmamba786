@@ -114,7 +114,7 @@ class BoundNeXt(nn.Module):
         self.bgi_2 = BGI_Module(dims[1])
         self.bgi_1 = BGI_Module(dims[0])
         
-        # [SOTA FIX 2] Deep Supervision Auxiliary Head
+        # Deep Supervision Auxiliary Head
         self.aux_head = UWFF_Head(dims[1], num_classes)
         self.head = UWFF_Head(dims[0], num_classes)
 
@@ -132,9 +132,7 @@ class BoundNeXt(nn.Module):
         f1_3, f2_3 = self.sc_up(f1_list[3], f2_list[3])
         cd_3 = self.temporal_fusion(f1_3, f2_3, boundary_map)
         
-        # --- [SOTA FIX 1] Change-Aware Skip Connections ---
-        # Injecting the absolute difference into the skips ensures the decoders 
-        # are never blind to the temporal changes at high resolutions.
+        # Change-Aware Skip Connections
         diff_2 = torch.abs(f1_list[2] - f2_list[2])
         x1 = self.dec_ss1_3(f1_3, f1_list[2] + diff_2)
         x2 = self.dec_ss2_3(f2_3, f2_list[2] + diff_2)
@@ -149,10 +147,8 @@ class BoundNeXt(nn.Module):
         # --- Deep Supervision Output Capture ---
         aux_outputs = None
         if self.training:
+            # [SOTA FIX 5] Keep auxiliary outputs at native resolution! Upsampling ruins gradient edges.
             aux_ss1, aux_ss2, aux_cd = self.aux_head(x1, x2, cd_x)
-            aux_ss1 = F.interpolate(aux_ss1, size=img_size, mode='bilinear', align_corners=False)
-            aux_ss2 = F.interpolate(aux_ss2, size=img_size, mode='bilinear', align_corners=False)
-            aux_cd = F.interpolate(aux_cd, size=img_size, mode='bilinear', align_corners=False)
             aux_outputs = (aux_ss1, aux_ss2, aux_cd)
         
         x1 = self.dec_ss1_1(x1, f1_list[0] + diff_0)
