@@ -73,26 +73,40 @@ class BinaryFocalLoss(nn.Module):
         focal_loss = self.alpha * (1 - pt) ** self.gamma * bce_loss
         return focal_loss.mean()
 
-class SymmetricSCLoss(nn.Module):
+class JSDivergenceSCLoss(nn.Module):
     """
-    [SOTA FIX 3] Symmetric MSE Consistency
-    Replaced erratic Absolute Difference on raw probabilities with stable MSE.
+    [SOTA FIX 4] Jensen-Shannon Divergence Consistency.
+    Replaces MSE on Softmax. JSD is the mathematically rigorous way 
+    to measure distance between two probability distributions, 
+    preventing gradient collapse when probabilities are near 0 or 1.
     """
-    def __init__(self):
+    def __init__(self, eps=1e-8):
         super().__init__()
+        self.eps = eps
 
     def forward(self, logits1, logits2, gt_cd):
         unchanged_mask = (gt_cd == 0).unsqueeze(1).float() 
-        probs1 = F.softmax(logits1, dim=1)
-        probs2 = F.softmax(logits2, dim=1)
         
-        # Detached symmetric MSE prevents catastrophic gradient collapse
-        mse1 = F.mse_loss(probs1, probs2.detach(), reduction='none') * unchanged_mask
-        mse2 = F.mse_loss(probs2, probs1.detach(), reduction='none') * unchanged_mask
+        p1 = F.softmax(logits1, dim=1)
+        p2 = F.softmax(logits2, dim=1)
+        
+        # M is the average distribution
+        m = 0.5 * (p1 + p2)
+        
+        # KL Divergence manually calculated for stability
+        # KL(P || M) = P * log(P / M)
+        kl1 = p1 * (torch.log(p1 + self.eps) - torch.log(m + self.eps))
+        kl2 = p2 * (torch.log(p2 + self.eps) - torch.log(m + self.eps))
+        
+        # JS is symmetric: 0.5 * KL(P||M) + 0.5 * KL(Q||M)
+        js = 0.5 * (kl1 + kl2)
+        
+        # Apply mask and mean over channels
+        js_masked = js.sum(dim=1, keepdim=True) * unchanged_mask
         
         num_unchanged = unchanged_mask.sum()
         if num_unchanged > 0:
-            return (mse1.sum() + mse2.sum()) / (num_unchanged * 2)
+            return js_masked.sum() / (num_unchanged + self.eps)
         return torch.tensor(0.0, device=logits1.device)
 
 class BoundMambaLoss(nn.Module):
@@ -101,16 +115,16 @@ class BoundMambaLoss(nn.Module):
         
         self.ohem_ce = OHEMCrossEntropyLoss(ignore_index=ignore_index, keep_ratio=0.7)
         self.mc_dice = MultiClassDiceLoss(num_classes=num_classes, ignore_index=ignore_index)
-        self.scl = SymmetricSCLoss()
+        self.scl = JSDivergenceSCLoss() # Upgraded to JSD
         
         self.bce_focal = BinaryFocalLoss(alpha=0.25, gamma=2.0)
         self.dice = DiceLoss()
         
         # Adjusted weights for proper gradient prioritization
         self.lambda_ss = 1.0 
-        self.lambda_cd = 2.0  # Increased to boost F1-BCD bottleneck
+        self.lambda_cd = 2.0  # High weight to boost F1-BCD bottleneck
         self.lambda_bd = 0.5  # Auxiliary tasks should not overpower main tasks
-        self.lambda_scl = 0.2 # Significantly reduced to prevent washing out CE gradients
+        self.lambda_scl = 0.5 # Increased from 0.2 because JSD gradients are more stable than MSE
 
     def forward(self, outputs, targets):
         pred_ss1, pred_ss2, pred_cd, pred_bd = outputs
