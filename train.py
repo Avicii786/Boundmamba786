@@ -4,6 +4,7 @@ import argparse
 import torch
 import numpy as np
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import warnings
 import logging
@@ -16,7 +17,7 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, Callback, EarlyStopping
 
 from boundmamba import BoundNeXt, BoundMambaLoss
-from boundmamba.utils import extract_boundary
+from boundmamba.utils import extract_composite_boundary
 from boundmamba.metrics import SCDMetrics
 from dataset import SCDDataset
 
@@ -33,6 +34,29 @@ class CleanupCallback(Callback):
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+def bitemporal_mixup(t1, t2, l1, l2, bcd, alpha=0.4):
+    """
+    [SOTA FIX 6] Bitemporal MixUp Data Augmentation.
+    Mixes batches together to force the model to learn structural changes
+    rather than memorizing the natural illumination of the dataset.
+    """
+    if np.random.rand() > 0.5:
+        return t1, t2, l1, l2, bcd
+        
+    lam = np.random.beta(alpha, alpha)
+    batch_size = t1.size(0)
+    index = torch.randperm(batch_size).to(t1.device)
+    
+    mixed_t1 = lam * t1 + (1 - lam) * t1[index, :]
+    mixed_t2 = lam * t2 + (1 - lam) * t2[index, :]
+    
+    # We don't mix the labels smoothly, we use hard thresholding for categorical masks
+    mixed_l1 = torch.where(torch.rand_like(l1.float()) < lam, l1, l1[index, :])
+    mixed_l2 = torch.where(torch.rand_like(l2.float()) < lam, l2, l2[index, :])
+    mixed_bcd = torch.where(torch.rand_like(bcd.float()) < lam, bcd, bcd[index, :])
+    
+    return mixed_t1, mixed_t2, mixed_l1, mixed_l2, mixed_bcd
 
 class BoundNeXtLightning(pl.LightningModule):
     def __init__(self, args):
@@ -69,18 +93,28 @@ class BoundNeXtLightning(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         t1, t2, l1, l2, gt_cd = batch['img_A'], batch['img_B'], batch['sem1'], batch['sem2'], batch['bcd']
-        gt_bd = extract_boundary(gt_cd)
         
-        # [THE FIX] Model now returns 2 elements: Main Outputs and Aux Outputs
+        # 1. Apply Bitemporal MixUp
+        t1, t2, l1, l2, gt_cd = bitemporal_mixup(t1, t2, l1, l2, gt_cd)
+        
+        # 2. Extract Composite Boundary (Both Change and Semantic Structural Edges)
+        gt_bd = extract_composite_boundary(gt_cd, l1, l2)
+        
         outputs, aux_outputs = self(t1, t2)
         pred_ss1, pred_ss2, pred_cd, pred_bd = outputs
         
-        # 1. Main Loss
+        # 3. Main Loss
         loss_main, loss_dict = self.criterion(outputs, (l1, l2, gt_cd, gt_bd))
         
-        # 2. Deep Supervision Loss (Auxiliary)
-        # We reuse pred_bd for the boundary loss since aux_head doesn't predict boundaries
-        loss_aux, _ = self.criterion((aux_outputs[0], aux_outputs[1], aux_outputs[2], pred_bd), (l1, l2, gt_cd, gt_bd))
+        # 4. Deep Supervision Loss (Native Resolution Downsampling)
+        aux_shape = aux_outputs[0].shape[2:]
+        # Nearest neighbor interpolation safely downsamples categorical mask integer values
+        aux_l1 = F.interpolate(l1.unsqueeze(1).float(), size=aux_shape, mode='nearest').squeeze(1).long()
+        aux_l2 = F.interpolate(l2.unsqueeze(1).float(), size=aux_shape, mode='nearest').squeeze(1).long()
+        aux_cd = F.interpolate(gt_cd.unsqueeze(1).float(), size=aux_shape, mode='nearest').squeeze(1).float()
+        aux_bd = F.interpolate(gt_bd.unsqueeze(1).float(), size=aux_shape, mode='nearest').squeeze(1).float()
+        
+        loss_aux, _ = self.criterion((aux_outputs[0], aux_outputs[1], aux_outputs[2], aux_outputs[2]), (aux_l1, aux_l2, aux_cd, aux_bd))
         
         # Combined Loss with 0.4 Aux Weight
         loss = loss_main + (0.4 * loss_aux)
@@ -93,9 +127,11 @@ class BoundNeXtLightning(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         t1, t2, l1, l2, gt_cd = batch['img_A'], batch['img_B'], batch['sem1'], batch['sem2'], batch['bcd']
         
-        # Validation only returns the main outputs (because model.training == False)
+        # Generate composite boundary for validation loss tracking
+        gt_bd = extract_composite_boundary(gt_cd, l1, l2)
+        
         logits_ss1, logits_ss2, logits_cd, logits_bd = self(t1, t2)
-        loss, _ = self.criterion((logits_ss1, logits_ss2, logits_cd, logits_bd), (l1, l2, gt_cd, extract_boundary(gt_cd)))
+        loss, _ = self.criterion((logits_ss1, logits_ss2, logits_cd, logits_bd), (l1, l2, gt_cd, gt_bd))
         self.log('val_loss', loss, on_epoch=True, sync_dist=True)
         
         p_ss1 = torch.argmax(logits_ss1, dim=1)
@@ -227,7 +263,7 @@ def main():
 
     if trainer.is_global_zero:
         eff_bs = args.batch_size * args.accumulate_grad_batches * (2 if args.accelerator == 'gpu' else 8)
-        print(f"\n🚀 BoundNeXt: {args.model_type.upper()} | Accel: {args.accelerator.upper()} | Eff. Batch: {eff_bs} | Deep Supervision: ON | Change-Aware Skips: ON")
+        print(f"\n🚀 BoundNeXt: {args.model_type.upper()} | Accel: {args.accelerator.upper()} | Eff. Batch: {eff_bs} | MixUp: ON | Composite Boundary: ON")
         print(f"🛑 Early Stopping: ON (Patience: {args.patience} Epochs)")
     
     trainer.fit(model, train_loader, val_loader)
