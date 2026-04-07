@@ -128,10 +128,10 @@ class SCDDataset(data.Dataset):
                     sem1 = TF.rotate(sem1, angle); sem2 = TF.rotate(sem2, angle); bcd = TF.rotate(bcd, angle)
 
         # 2. Color & Blur
-        if random.random() < 0.8: img_A = self.color_jitter(img_A)
-        if random.random() < 0.8: img_B = self.color_jitter(img_B)
-        if random.random() < 0.5: img_A = self.gaussian_blur(img_A)
-        if random.random() < 0.5: img_B = self.gaussian_blur(img_B)
+        # if random.random() < 0.8: img_A = self.color_jitter(img_A)
+        # if random.random() < 0.8: img_B = self.color_jitter(img_B)
+        # if random.random() < 0.5: img_A = self.gaussian_blur(img_A)
+        # if random.random() < 0.5: img_B = self.gaussian_blur(img_B)
             
         return img_A, img_B, sem1, sem2, bcd
 
