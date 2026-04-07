@@ -35,28 +35,46 @@ class CleanupCallback(Callback):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-def bitemporal_mixup(t1, t2, l1, l2, bcd, alpha=0.4):
+def bitemporal_mixup(t1, t2, l1, l2, bcd, alpha=1.0):
     """
-    [SOTA FIX 6] Bitemporal MixUp Data Augmentation.
-    Mixes batches together to force the model to learn structural changes
-    rather than memorizing the natural illumination of the dataset.
+    [CRITICAL SOTA FIX 6] Spatial CutMix instead of Alpha-Blending.
+    Previously, we were using torch.rand_like on masks, which created 
+    salt-and-pepper TV static noise and artificially capped the mIoU.
+    Now, we cut a solid spatial rectangle from one batch and paste it 
+    into another. This strictly preserves structural edges for the 
+    composite boundary head.
     """
     if np.random.rand() > 0.5:
         return t1, t2, l1, l2, bcd
-        
+
+    B, C, H, W = t1.shape
+    index = torch.randperm(B).to(t1.device)
+
+    # Generate random bounding box parameters based on Beta distribution
     lam = np.random.beta(alpha, alpha)
-    batch_size = t1.size(0)
-    index = torch.randperm(batch_size).to(t1.device)
+    cut_rat = np.sqrt(1. - lam)
+    cut_w = int(W * cut_rat)
+    cut_h = int(H * cut_rat)
+
+    # Uniformly pick the center of the crop
+    cx = np.random.randint(W)
+    cy = np.random.randint(H)
+
+    # Calculate coordinates
+    bbx1 = np.clip(cx - cut_w // 2, 0, W)
+    bby1 = np.clip(cy - cut_h // 2, 0, H)
+    bbx2 = np.clip(cx + cut_w // 2, 0, W)
+    bby2 = np.clip(cy + cut_h // 2, 0, H)
+
+    # Apply CutMix (Physically swapping rectangular regions)
+    t1[:, :, bby1:bby2, bbx1:bbx2] = t1[index, :, bby1:bby2, bbx1:bbx2]
+    t2[:, :, bby1:bby2, bbx1:bbx2] = t2[index, :, bby1:bby2, bbx1:bbx2]
     
-    mixed_t1 = lam * t1 + (1 - lam) * t1[index, :]
-    mixed_t2 = lam * t2 + (1 - lam) * t2[index, :]
-    
-    # We don't mix the labels smoothly, we use hard thresholding for categorical masks
-    mixed_l1 = torch.where(torch.rand_like(l1.float()) < lam, l1, l1[index, :])
-    mixed_l2 = torch.where(torch.rand_like(l2.float()) < lam, l2, l2[index, :])
-    mixed_bcd = torch.where(torch.rand_like(bcd.float()) < lam, bcd, bcd[index, :])
-    
-    return mixed_t1, mixed_t2, mixed_l1, mixed_l2, mixed_bcd
+    l1[:, bby1:bby2, bbx1:bbx2] = l1[index, bby1:bby2, bbx1:bbx2]
+    l2[:, bby1:bby2, bbx1:bbx2] = l2[index, bby1:bby2, bbx1:bbx2]
+    bcd[:, bby1:bby2, bbx1:bbx2] = bcd[index, bby1:bby2, bbx1:bbx2]
+
+    return t1, t2, l1, l2, bcd
 
 class BoundNeXtLightning(pl.LightningModule):
     def __init__(self, args):
@@ -94,7 +112,7 @@ class BoundNeXtLightning(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         t1, t2, l1, l2, gt_cd = batch['img_A'], batch['img_B'], batch['sem1'], batch['sem2'], batch['bcd']
         
-        # 1. Apply Bitemporal MixUp
+        # 1. Apply Bitemporal Spatial CutMix
         t1, t2, l1, l2, gt_cd = bitemporal_mixup(t1, t2, l1, l2, gt_cd)
         
         # 2. Extract Composite Boundary (Both Change and Semantic Structural Edges)
@@ -263,7 +281,7 @@ def main():
 
     if trainer.is_global_zero:
         eff_bs = args.batch_size * args.accumulate_grad_batches * (2 if args.accelerator == 'gpu' else 8)
-        print(f"\n🚀 BoundNeXt: {args.model_type.upper()} | Accel: {args.accelerator.upper()} | Eff. Batch: {eff_bs} | MixUp: ON | Composite Boundary: ON")
+        print(f"\n🚀 BoundNeXt: {args.model_type.upper()} | Accel: {args.accelerator.upper()} | Eff. Batch: {eff_bs} | Spatial CutMix: ON | Composite Boundary: ON")
         print(f"🛑 Early Stopping: ON (Patience: {args.patience} Epochs)")
     
     trainer.fit(model, train_loader, val_loader)
