@@ -37,36 +37,30 @@ class CleanupCallback(Callback):
 
 def bitemporal_mixup(t1, t2, l1, l2, bcd, alpha=1.0):
     """
-    [CRITICAL SOTA FIX 6] Spatial CutMix instead of Alpha-Blending.
-    Previously, we were using torch.rand_like on masks, which created 
-    salt-and-pepper TV static noise and artificially capped the mIoU.
-    Now, we cut a solid spatial rectangle from one batch and paste it 
-    into another. This strictly preserves structural edges for the 
-    composite boundary head.
+    [RELAXED FIX] Probability reduced to 25%.
+    The network needs to see unadulterated global context most of the time 
+    so it doesn't get overwhelmed by stitched boundaries.
     """
-    if np.random.rand() > 0.5:
+    if np.random.rand() > 0.25: # Changed from 0.5 to 0.25
         return t1, t2, l1, l2, bcd
 
     B, C, H, W = t1.shape
     index = torch.randperm(B).to(t1.device)
 
-    # Generate random bounding box parameters based on Beta distribution
     lam = np.random.beta(alpha, alpha)
-    cut_rat = np.sqrt(1. - lam)
+    # Ensure we don't cut more than 60% of the image to preserve context
+    cut_rat = np.clip(np.sqrt(1. - lam), 0.1, 0.6) 
     cut_w = int(W * cut_rat)
     cut_h = int(H * cut_rat)
 
-    # Uniformly pick the center of the crop
     cx = np.random.randint(W)
     cy = np.random.randint(H)
 
-    # Calculate coordinates
     bbx1 = np.clip(cx - cut_w // 2, 0, W)
     bby1 = np.clip(cy - cut_h // 2, 0, H)
     bbx2 = np.clip(cx + cut_w // 2, 0, W)
     bby2 = np.clip(cy + cut_h // 2, 0, H)
 
-    # Apply CutMix (Physically swapping rectangular regions)
     t1[:, :, bby1:bby2, bbx1:bbx2] = t1[index, :, bby1:bby2, bbx1:bbx2]
     t2[:, :, bby1:bby2, bbx1:bbx2] = t2[index, :, bby1:bby2, bbx1:bbx2]
     
@@ -112,21 +106,15 @@ class BoundNeXtLightning(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         t1, t2, l1, l2, gt_cd = batch['img_A'], batch['img_B'], batch['sem1'], batch['sem2'], batch['bcd']
         
-        # 1. Apply Bitemporal Spatial CutMix
         t1, t2, l1, l2, gt_cd = bitemporal_mixup(t1, t2, l1, l2, gt_cd)
-        
-        # 2. Extract Composite Boundary (Both Change and Semantic Structural Edges)
         gt_bd = extract_composite_boundary(gt_cd, l1, l2)
         
         outputs, aux_outputs = self(t1, t2)
         pred_ss1, pred_ss2, pred_cd, pred_bd = outputs
         
-        # 3. Main Loss
         loss_main, loss_dict = self.criterion(outputs, (l1, l2, gt_cd, gt_bd))
         
-        # 4. Deep Supervision Loss (Native Resolution Downsampling)
         aux_shape = aux_outputs[0].shape[2:]
-        # Nearest neighbor interpolation safely downsamples categorical mask integer values
         aux_l1 = F.interpolate(l1.unsqueeze(1).float(), size=aux_shape, mode='nearest').squeeze(1).long()
         aux_l2 = F.interpolate(l2.unsqueeze(1).float(), size=aux_shape, mode='nearest').squeeze(1).long()
         aux_cd = F.interpolate(gt_cd.unsqueeze(1).float(), size=aux_shape, mode='nearest').squeeze(1).float()
@@ -134,7 +122,6 @@ class BoundNeXtLightning(pl.LightningModule):
         
         loss_aux, _ = self.criterion((aux_outputs[0], aux_outputs[1], aux_outputs[2], aux_outputs[2]), (aux_l1, aux_l2, aux_cd, aux_bd))
         
-        # Combined Loss with 0.4 Aux Weight
         loss = loss_main + (0.4 * loss_aux)
         
         self.log('t_loss', loss, on_step=False, on_epoch=True, sync_dist=True)
@@ -145,7 +132,6 @@ class BoundNeXtLightning(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         t1, t2, l1, l2, gt_cd = batch['img_A'], batch['img_B'], batch['sem1'], batch['sem2'], batch['bcd']
         
-        # Generate composite boundary for validation loss tracking
         gt_bd = extract_composite_boundary(gt_cd, l1, l2)
         
         logits_ss1, logits_ss2, logits_cd, logits_bd = self(t1, t2)
@@ -200,7 +186,8 @@ class BoundNeXtLightning(pl.LightningModule):
         ], weight_decay=0.05)
         
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='max', factor=0.5, patience=5, min_lr=1e-6, verbose=False
+            # [RELAXED FIX] Increased patience from 5 to 8. Give it time before slashing LR.
+            optimizer, mode='max', factor=0.5, patience=5, min_lr=1e-6, verbose=False 
         )
         
         return {
@@ -281,7 +268,7 @@ def main():
 
     if trainer.is_global_zero:
         eff_bs = args.batch_size * args.accumulate_grad_batches * (2 if args.accelerator == 'gpu' else 8)
-        print(f"\n🚀 BoundNeXt: {args.model_type.upper()} | Accel: {args.accelerator.upper()} | Eff. Batch: {eff_bs} | Spatial CutMix: ON | Composite Boundary: ON")
+        print(f"\n🚀 BoundNeXt: {args.model_type.upper()} | Accel: {args.accelerator.upper()} | Eff. Batch: {eff_bs} | RELAXED Regularization")
         print(f"🛑 Early Stopping: ON (Patience: {args.patience} Epochs)")
     
     trainer.fit(model, train_loader, val_loader)
