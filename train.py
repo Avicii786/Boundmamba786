@@ -36,19 +36,13 @@ class CleanupCallback(Callback):
                 torch.cuda.empty_cache()
 
 def bitemporal_mixup(t1, t2, l1, l2, bcd, alpha=1.0):
-    """
-    [RELAXED FIX] Probability reduced to 25%.
-    The network needs to see unadulterated global context most of the time 
-    so it doesn't get overwhelmed by stitched boundaries.
-    """
-    if np.random.rand() > 0.25: # Changed from 0.5 to 0.25
+    if np.random.rand() > 0.25: 
         return t1, t2, l1, l2, bcd
 
     B, C, H, W = t1.shape
     index = torch.randperm(B).to(t1.device)
 
     lam = np.random.beta(alpha, alpha)
-    # Ensure we don't cut more than 60% of the image to preserve context
     cut_rat = np.clip(np.sqrt(1. - lam), 0.1, 0.6) 
     cut_w = int(W * cut_rat)
     cut_h = int(H * cut_rat)
@@ -142,11 +136,24 @@ class BoundNeXtLightning(pl.LightningModule):
         p_ss2 = torch.argmax(logits_ss2, dim=1)
         p_cd = (torch.sigmoid(logits_cd) > 0.5).long().squeeze(1)
         
+        # --- [SOTA POST-PROCESSING FIX] Dual-Way Conflict Resolution ---
+        
+        # Rule 1: If Semantic heads predict the exact same class, it implies NO CHANGE.
+        # The deep semantic network is highly accurate at rejecting pseudo-changes.
+        # We override the binary change map to 0 in these regions.
+        semantic_agree = (p_ss1 == p_ss2)
+        p_cd = torch.where(semantic_agree, torch.zeros_like(p_cd), p_cd)
+
+        # Rule 2: If the Change head still confidently says NO CHANGE (p_cd == 0),
+        # but the semantic heads disagree, we force the semantic heads to agree 
+        # using their highest combined ensemble confidence.
         logits_shared = logits_ss1 + logits_ss2
         p_shared = torch.argmax(logits_shared, dim=1)
         
         p_ss1 = torch.where(p_cd == 0, p_shared, p_ss1)
         p_ss2 = torch.where(p_cd == 0, p_shared, p_ss2)
+        
+        # ----------------------------------------------------------------
         
         self.metrics.update(p_ss1, p_ss2, p_cd, l1, l2, gt_cd)
 
@@ -186,8 +193,7 @@ class BoundNeXtLightning(pl.LightningModule):
         ], weight_decay=0.05)
         
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            # [RELAXED FIX] Increased patience from 5 to 8. Give it time before slashing LR.
-            optimizer, mode='max', factor=0.5, patience=5, min_lr=1e-6, verbose=False 
+            optimizer, mode='max', factor=0.5, patience=8, min_lr=1e-6, verbose=False 
         )
         
         return {
@@ -249,8 +255,10 @@ def main():
     strategy = "ddp_find_unused_parameters_true" if args.accelerator == 'gpu' else "auto"
     devices = int(args.devices) if args.devices.isdigit() else args.devices
     precision = "16-mixed" if args.accelerator == 'gpu' else "bf16-mixed"
-    sync_bn = True if args.accelerator == 'gpu' else False
-
+    
+    # [SOTA BATCH FIX] sync_batchnorm is no longer needed because we ripped out BatchNorm
+    # entirely in favor of GroupNorm, which is intrinsically immune to multi-GPU synchronization issues.
+    
     trainer = pl.Trainer(
         accelerator=args.accelerator, 
         devices=devices, 
@@ -262,13 +270,12 @@ def main():
         gradient_clip_val=1.0, 
         callbacks=[checkpoint_callback, early_stop_callback, CleanupCallback()], 
         enable_progress_bar=False, 
-        logger=False, 
-        sync_batchnorm=sync_bn
+        logger=False
     )
 
     if trainer.is_global_zero:
         eff_bs = args.batch_size * args.accumulate_grad_batches * (2 if args.accelerator == 'gpu' else 8)
-        print(f"\n🚀 BoundNeXt: {args.model_type.upper()} | Accel: {args.accelerator.upper()} | Eff. Batch: {eff_bs} | RELAXED Regularization")
+        print(f"\n🚀 BoundNeXt: {args.model_type.upper()} | Accel: {args.accelerator.upper()} | Eff. Batch: {eff_bs} | GroupNorm: ON")
         print(f"🛑 Early Stopping: ON (Patience: {args.patience} Epochs)")
     
     trainer.fit(model, train_loader, val_loader)
