@@ -16,7 +16,7 @@ class ASPP(nn.Module):
         )
         self.out_conv = nn.Sequential(
             nn.Conv2d(out_channels * 5, out_channels, 1, bias=False),
-            nn.BatchNorm2d(out_channels),
+            nn.GroupNorm(16, out_channels), # [SOTA BATCH FIX] GroupNorm instead of BatchNorm
             nn.ReLU(inplace=True),
             nn.Dropout(0.1)
         )
@@ -40,7 +40,7 @@ class SC_UP_Module(nn.Module):
         
         self.corr_conv = nn.Sequential(
             nn.Conv2d(mid_ch * 2, mid_ch, 3, padding=1),
-            nn.BatchNorm2d(mid_ch),
+            nn.GroupNorm(16, mid_ch), # [SOTA BATCH FIX]
             nn.ReLU(inplace=True)
         )
         self.proj1 = nn.Conv2d(mid_ch, in_channels, 1)
@@ -59,32 +59,29 @@ class SC_UP_Module(nn.Module):
         return f1_out, f2_out
 
 class BGI_Module(nn.Module):
-    """
-    [SOTA FIX 1] Dual-Phase Task Interaction.
-    Previously, this module only fused x1 and x2 into the Change stream (cd).
-    Now, it projects the Change stream BACK into the Semantic streams (x1, x2)
-    so the semantic decoders know exactly where the changes are.
-    """
     def __init__(self, in_channels):
         super().__init__()
         self.spatial_gate = nn.Sequential(
             nn.Conv2d(1, 16, 3, padding=1),
-            nn.BatchNorm2d(16), nn.ReLU(inplace=True),
+            nn.GroupNorm(8, 16), # [SOTA BATCH FIX]
+            nn.ReLU(inplace=True),
             nn.Conv2d(16, 1, 1),
             nn.Sigmoid()
         )
         self.cd_fusion = nn.Sequential(
             nn.Conv2d(in_channels * 3, in_channels, 3, padding=1),
-            nn.BatchNorm2d(in_channels), nn.ReLU(inplace=True)
+            nn.GroupNorm(16, in_channels), # [SOTA BATCH FIX]
+            nn.ReLU(inplace=True)
         )
-        # Injection paths for semantics
         self.ss1_fusion = nn.Sequential(
             nn.Conv2d(in_channels * 2, in_channels, 3, padding=1),
-            nn.BatchNorm2d(in_channels), nn.ReLU(inplace=True)
+            nn.GroupNorm(16, in_channels), # [SOTA BATCH FIX]
+            nn.ReLU(inplace=True)
         )
         self.ss2_fusion = nn.Sequential(
             nn.Conv2d(in_channels * 2, in_channels, 3, padding=1),
-            nn.BatchNorm2d(in_channels), nn.ReLU(inplace=True)
+            nn.GroupNorm(16, in_channels), # [SOTA BATCH FIX]
+            nn.ReLU(inplace=True)
         )
 
     def forward(self, x1, x2, cd, bd_map):
@@ -94,35 +91,31 @@ class BGI_Module(nn.Module):
         gate = self.spatial_gate(bd_map)
         cd_sharpened = cd * (1 + gate)
         
-        # 1. Fuse into CD
         cd_out = self.cd_fusion(torch.cat([x1, x2, cd_sharpened], dim=1))
-        
-        # 2. Inject CD back into Semantics
         x1_out = self.ss1_fusion(torch.cat([x1, cd_out], dim=1))
         x2_out = self.ss2_fusion(torch.cat([x2, cd_out], dim=1))
         
         return x1_out, x2_out, cd_out
 
 class UWFF_Head(nn.Module):
-    """
-    [SOTA FIX 3] Stronger Output Classifier.
-    Replaced weak 1x1 Convs with 3x3 Context blocks to prevent salt-and-pepper fragmentation.
-    """
     def __init__(self, in_channels, num_classes):
         super().__init__()
         self.ss1_head = nn.Sequential(
             nn.Conv2d(in_channels, in_channels, 3, padding=1),
-            nn.BatchNorm2d(in_channels), nn.ReLU(inplace=True),
+            nn.GroupNorm(16, in_channels), # [SOTA BATCH FIX]
+            nn.ReLU(inplace=True),
             nn.Conv2d(in_channels, num_classes, 1)
         )
         self.ss2_head = nn.Sequential(
             nn.Conv2d(in_channels, in_channels, 3, padding=1),
-            nn.BatchNorm2d(in_channels), nn.ReLU(inplace=True),
+            nn.GroupNorm(16, in_channels), # [SOTA BATCH FIX]
+            nn.ReLU(inplace=True),
             nn.Conv2d(in_channels, num_classes, 1)
         )
         self.cd_head = nn.Sequential(
             nn.Conv2d(in_channels, in_channels, 3, padding=1),
-            nn.BatchNorm2d(in_channels), nn.ReLU(inplace=True),
+            nn.GroupNorm(16, in_channels), # [SOTA BATCH FIX]
+            nn.ReLU(inplace=True),
             nn.Conv2d(in_channels, 1, 1)
         )
 
