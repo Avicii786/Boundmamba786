@@ -4,11 +4,11 @@ import torch.nn.functional as F
 
 class OHEMCrossEntropyLoss(nn.Module):
     """
-    [SOTA FIX 2] Online Hard Example Mining (OHEM)
-    Forces the network to ignore the 30% easiest pixels in every batch
-    and dedicate all CE gradient power to the hardest minority classes.
+    [RELAXED FIX] Increased keep_ratio from 0.7 to 0.9.
+    When combined with CutMix, throwing away 30% of gradients starves the model.
+    Now we only ignore the absolute easiest 10% of pixels.
     """
-    def __init__(self, ignore_index=255, keep_ratio=0.7):
+    def __init__(self, ignore_index=255, keep_ratio=0.9):
         super().__init__()
         self.ignore_index = ignore_index
         self.keep_ratio = keep_ratio
@@ -74,12 +74,6 @@ class BinaryFocalLoss(nn.Module):
         return focal_loss.mean()
 
 class JSDivergenceSCLoss(nn.Module):
-    """
-    [SOTA FIX 4] Jensen-Shannon Divergence Consistency.
-    Replaces MSE on Softmax. JSD is the mathematically rigorous way 
-    to measure distance between two probability distributions, 
-    preventing gradient collapse when probabilities are near 0 or 1.
-    """
     def __init__(self, eps=1e-8):
         super().__init__()
         self.eps = eps
@@ -90,18 +84,12 @@ class JSDivergenceSCLoss(nn.Module):
         p1 = F.softmax(logits1, dim=1)
         p2 = F.softmax(logits2, dim=1)
         
-        # M is the average distribution
         m = 0.5 * (p1 + p2)
         
-        # KL Divergence manually calculated for stability
-        # KL(P || M) = P * log(P / M)
         kl1 = p1 * (torch.log(p1 + self.eps) - torch.log(m + self.eps))
         kl2 = p2 * (torch.log(p2 + self.eps) - torch.log(m + self.eps))
         
-        # JS is symmetric: 0.5 * KL(P||M) + 0.5 * KL(Q||M)
         js = 0.5 * (kl1 + kl2)
-        
-        # Apply mask and mean over channels
         js_masked = js.sum(dim=1, keepdim=True) * unchanged_mask
         
         num_unchanged = unchanged_mask.sum()
@@ -113,18 +101,17 @@ class BoundMambaLoss(nn.Module):
     def __init__(self, num_classes=7, ignore_index=255):
         super().__init__()
         
-        self.ohem_ce = OHEMCrossEntropyLoss(ignore_index=ignore_index, keep_ratio=0.7)
+        self.ohem_ce = OHEMCrossEntropyLoss(ignore_index=ignore_index, keep_ratio=0.9) # Relaxed
         self.mc_dice = MultiClassDiceLoss(num_classes=num_classes, ignore_index=ignore_index)
-        self.scl = JSDivergenceSCLoss() # Upgraded to JSD
+        self.scl = JSDivergenceSCLoss()
         
         self.bce_focal = BinaryFocalLoss(alpha=0.25, gamma=2.0)
         self.dice = DiceLoss()
         
-        # Adjusted weights for proper gradient prioritization
         self.lambda_ss = 1.0 
-        self.lambda_cd = 2.0  # High weight to boost F1-BCD bottleneck
-        self.lambda_bd = 0.5  # Auxiliary tasks should not overpower main tasks
-        self.lambda_scl = 0.5 # Increased from 0.2 because JSD gradients are more stable than MSE
+        self.lambda_cd = 2.0  
+        self.lambda_bd = 0.5  
+        self.lambda_scl = 0.1 # [RELAXED FIX] Dropped from 0.5. Let the network make bolder predictions.
 
     def forward(self, outputs, targets):
         pred_ss1, pred_ss2, pred_cd, pred_bd = outputs
