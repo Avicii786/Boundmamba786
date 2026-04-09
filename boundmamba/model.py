@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .backbone import SiameseConvNeXtV2
-from .modules import SC_UP_Module, BGI_Module, UWFF_Head
+from .modules import ASPP, BGI_Module, UWFF_Head
 
 class BoundaryConditionedFusion(nn.Module):
     def __init__(self, in_channels, num_heads=8):
@@ -87,16 +87,34 @@ class BoundNeXt(nn.Module):
         )
         dims = self.encoder.dims 
         
-        self.sc_up = SC_UP_Module(dims[3])
         self.temporal_fusion = BoundaryConditionedFusion(in_channels=dims[3], num_heads=8)
         
+        # Move ASPP here to refine the fused Change Map specifically (huge VRAM savings + better context)
+        self.aspp_cd = ASPP(dims[3], dims[3])
+        
+        # Expand Boundary Head to accept diff_2 to prevent "Semantic Starvation"
         self.boundary_head = nn.Sequential(
-            nn.Conv2d(dims[0] + dims[1], 128, 3, padding=1),
+            nn.Conv2d(dims[0] + dims[1] + dims[2], 128, 3, padding=1),
             nn.BatchNorm2d(128), nn.ReLU(inplace=True),
             nn.Conv2d(128, 64, 3, padding=1),
             nn.BatchNorm2d(64), nn.ReLU(inplace=True),
             nn.Conv2d(64, 1, 1)
         )
+
+        # Skip Connection Projection Layers (Cat + 1x1 Conv) to prevent Normalization Shift
+        def _make_skip_proj(dim):
+            return nn.Sequential(
+                nn.Conv2d(dim * 2, dim, kernel_size=1, bias=False),
+                nn.BatchNorm2d(dim),
+                nn.ReLU(inplace=True)
+            )
+
+        self.skip_proj1_2 = _make_skip_proj(dims[2])
+        self.skip_proj2_2 = _make_skip_proj(dims[2])
+        self.skip_proj1_1 = _make_skip_proj(dims[1])
+        self.skip_proj2_1 = _make_skip_proj(dims[1])
+        self.skip_proj1_0 = _make_skip_proj(dims[0])
+        self.skip_proj2_0 = _make_skip_proj(dims[0])
 
         self.dec_ss1_3 = DecoderBlock(dims[3], dims[2], dims[2])
         self.dec_ss1_2 = DecoderBlock(dims[2], dims[1], dims[1])
@@ -122,37 +140,52 @@ class BoundNeXt(nn.Module):
         img_size = t1.shape[2:]
         f1_list, f2_list = self.encoder(t1, t2)
         
+        # Difference maps for Boundary & Skip Connections
         diff_0 = torch.abs(f1_list[0] - f2_list[0])
         diff_1 = torch.abs(f1_list[1] - f2_list[1])
-        diff_1_up = F.interpolate(diff_1, size=diff_0.shape[2:], mode='bilinear', align_corners=False)
+        diff_2 = torch.abs(f1_list[2] - f2_list[2])
         
-        boundary_logits = self.boundary_head(torch.cat([diff_0, diff_1_up], dim=1))
+        diff_1_up = F.interpolate(diff_1, size=diff_0.shape[2:], mode='bilinear', align_corners=False)
+        diff_2_up = F.interpolate(diff_2, size=diff_0.shape[2:], mode='bilinear', align_corners=False)
+        
+        boundary_logits = self.boundary_head(torch.cat([diff_0, diff_1_up, diff_2_up], dim=1))
         boundary_map = torch.sigmoid(boundary_logits)
         
-        f1_3, f2_3 = self.sc_up(f1_list[3], f2_list[3])
+        # Stage 3 Temporal Fusion & Global Context (Change Map specifically)
+        f1_3, f2_3 = f1_list[3], f2_list[3]
         cd_3 = self.temporal_fusion(f1_3, f2_3, boundary_map)
+        cd_3 = self.aspp_cd(cd_3)
         
-        # Change-Aware Skip Connections
-        diff_2 = torch.abs(f1_list[2] - f2_list[2])
-        x1 = self.dec_ss1_3(f1_3, f1_list[2] + diff_2)
-        x2 = self.dec_ss2_3(f2_3, f2_list[2] + diff_2)
+        # Stage 2 Decoding with Mathematically Safe Skip Connections
+        skip1_2 = self.skip_proj1_2(torch.cat([f1_list[2], diff_2], dim=1))
+        skip2_2 = self.skip_proj2_2(torch.cat([f2_list[2], diff_2], dim=1))
+        
+        x1 = self.dec_ss1_3(f1_3, skip1_2)
+        x2 = self.dec_ss2_3(f2_3, skip2_2)
         cd_x = self.dec_cd_3(cd_3)
         x1, x2, cd_x = self.bgi_3(x1, x2, cd_x, boundary_map) 
         
-        x1 = self.dec_ss1_2(x1, f1_list[1] + diff_1)
-        x2 = self.dec_ss2_2(x2, f2_list[1] + diff_1)
+        # Stage 1 Decoding
+        skip1_1 = self.skip_proj1_1(torch.cat([f1_list[1], diff_1], dim=1))
+        skip2_1 = self.skip_proj2_1(torch.cat([f2_list[1], diff_1], dim=1))
+        
+        x1 = self.dec_ss1_2(x1, skip1_1)
+        x2 = self.dec_ss2_2(x2, skip2_1)
         cd_x = self.dec_cd_2(cd_x)
         x1, x2, cd_x = self.bgi_2(x1, x2, cd_x, boundary_map) 
         
         # --- Deep Supervision Output Capture ---
         aux_outputs = None
         if self.training:
-            # [SOTA FIX 5] Keep auxiliary outputs at native resolution! Upsampling ruins gradient edges.
             aux_ss1, aux_ss2, aux_cd = self.aux_head(x1, x2, cd_x)
             aux_outputs = (aux_ss1, aux_ss2, aux_cd)
         
-        x1 = self.dec_ss1_1(x1, f1_list[0] + diff_0)
-        x2 = self.dec_ss2_1(x2, f2_list[0] + diff_0)
+        # Stage 0 Decoding
+        skip1_0 = self.skip_proj1_0(torch.cat([f1_list[0], diff_0], dim=1))
+        skip2_0 = self.skip_proj2_0(torch.cat([f2_list[0], diff_0], dim=1))
+        
+        x1 = self.dec_ss1_1(x1, skip1_0)
+        x2 = self.dec_ss2_1(x2, skip2_0)
         cd_x = self.dec_cd_1(cd_x)
         x1, x2, cd_x = self.bgi_1(x1, x2, cd_x, boundary_map) 
         
