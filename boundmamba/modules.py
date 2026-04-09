@@ -31,32 +31,6 @@ class ASPP(nn.Module):
         x_concat = torch.cat([x1, x2, x3, x4, x5], dim=1)
         return self.out_conv(x_concat)
 
-class SC_UP_Module(nn.Module):
-    def __init__(self, in_channels):
-        super().__init__()
-        mid_ch = in_channels // 2
-        self.aspp1 = ASPP(in_channels, mid_ch)
-        self.aspp2 = ASPP(in_channels, mid_ch)
-        
-        self.corr_conv = nn.Sequential(
-            nn.Conv2d(mid_ch * 2, mid_ch, 3, padding=1),
-            nn.GroupNorm(16, mid_ch), # [SOTA BATCH FIX]
-            nn.ReLU(inplace=True)
-        )
-        self.proj1 = nn.Conv2d(mid_ch, in_channels, 1)
-        self.proj2 = nn.Conv2d(mid_ch, in_channels, 1)
-
-    def forward(self, f1, f2):
-        f1_ctx = self.aspp1(f1)
-        f2_ctx = self.aspp2(f2)
-        
-        concat = torch.cat([f1_ctx, f2_ctx], dim=1)
-        corr = self.corr_conv(concat)
-        
-        f1_out = f1 + self.proj1(f1_ctx * corr)
-        f2_out = f2 + self.proj2(f2_ctx * corr)
-        
-        return f1_out, f2_out
 
 class BGI_Module(nn.Module):
     def __init__(self, in_channels):
