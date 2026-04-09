@@ -235,7 +235,7 @@ def main():
         dirpath=args.save_dir, 
         monitor="val_score", 
         mode="max", 
-        save_top_k=1, 
+        save_top_k=2, 
         save_last=False, 
         filename="best_model", 
         save_weights_only=True
@@ -257,7 +257,7 @@ def main():
         accelerator=args.accelerator, 
         devices=devices, 
         strategy=strategy,
-        min_epochs = 80,
+        min_epochs = 50,
         max_epochs=args.epochs, 
         precision=precision,
         accumulate_grad_batches=args.accumulate_grad_batches,
