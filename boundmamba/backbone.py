@@ -60,8 +60,10 @@ class TriDimensionalInteraction(nn.Module):
         diff_w = diff.mean(dim=2, keepdim=True)
         att_w = self.width_gate(diff_w)
         
-        # 3. Combine Attentions (Broadcasting handles the spatial dimensions)
-        combined_att = att_c * att_h * att_w
+        # 3. Combine Attentions (Fixing the Attention Collapse Bottleneck)
+        # We average them instead of multiplying to prevent the gradients 
+        # from exponentially vanishing when multiple sigmoids are chained.
+        combined_att = (att_c + att_h + att_w) / 3.0
         
         # 4. Residual Injection
         x1_out = x1 + self.gamma * (x1 * combined_att)
