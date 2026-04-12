@@ -85,7 +85,7 @@ def main():
     model.eval() 
     
     # Sweep thresholds for Binary Change Detection
-    thresholds = [0.40, 0.50, 0.55]
+    thresholds = [0.25, 0.30, 0.35, 0.40,]
     metrics_dict = {t: SCDMetrics(num_classes=num_classes) for t in thresholds}
     
     # Expanded TTA scales for maximum boundary resilience
