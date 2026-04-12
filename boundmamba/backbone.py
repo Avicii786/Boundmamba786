@@ -1,4 +1,6 @@
 import os
+import shutil
+import time
 import torch
 import torch.nn as nn
 import timm
@@ -61,8 +63,6 @@ class TriDimensionalInteraction(nn.Module):
         att_w = self.width_gate(diff_w)
         
         # 3. Combine Attentions (Fixing the Attention Collapse Bottleneck)
-        # We average them instead of multiplying to prevent the gradients 
-        # from exponentially vanishing when multiple sigmoids are chained.
         combined_att = (att_c + att_h + att_w) / 3.0
         
         # 4. Residual Injection
@@ -85,18 +85,34 @@ class SiameseConvNeXtV2(nn.Module):
         if download_pretrained:
             print("[Backbone] No local weights provided. Will attempt to download from TIMM/HuggingFace Hub...")
 
-        try:
-            self.base_model = timm.create_model(
-                model_type, 
-                pretrained=download_pretrained,  # Automatically downloads if True
-                in_chans=in_chans, 
-                features_only=False, 
-                num_classes=0,
-                drop_path_rate=drop_path_rate
-            )
-        except Exception as e:
-            print(f"[Backbone] Error creating model. Check internet connection or model_type name. Error: {e}")
-            raise e
+        # Robust Download Logic to handle Kaggle/HuggingFace network drops (UnexpectedEof)
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                self.base_model = timm.create_model(
+                    model_type, 
+                    pretrained=download_pretrained, 
+                    in_chans=in_chans, 
+                    features_only=False, 
+                    num_classes=0,
+                    drop_path_rate=drop_path_rate
+                )
+                break # Success, break out of retry loop
+            except Exception as e:
+                print(f"[Backbone] WARNING: Model creation/download failed on attempt {attempt + 1}/{max_retries}.")
+                print(f"[Backbone] Error details: {e}")
+                
+                if attempt < max_retries - 1:
+                    print("[Backbone] Kaggle network likely dropped the connection. Clearing corrupted cache and retrying in 5 seconds...")
+                    # Clear the potentially corrupted partial download
+                    cache_dir = os.path.expanduser('~/.cache/huggingface/hub')
+                    if os.path.exists(cache_dir):
+                        shutil.rmtree(cache_dir, ignore_errors=True)
+                    time.sleep(5)
+                else:
+                    print("[Backbone] FATAL: Failed to download weights after 3 attempts.")
+                    print("[Backbone] Workaround: Download the weights manually, upload as a Kaggle dataset, and pass via --weights")
+                    raise e
 
         # Local Loading Logic (Only triggers if a path is explicitly provided)
         if checkpoint_path and os.path.isfile(checkpoint_path):
@@ -116,7 +132,6 @@ class SiameseConvNeXtV2(nn.Module):
                 print(f"[Backbone] Error loading local weights: {e}")
         
         # Set dimensions based on ConvNeXt architecture variants
-        # Tiny and Small share the same channel dimensions, Base is wider
         if 'tiny' in model_type or 'small' in model_type: 
             self.dims = [96, 192, 384, 768]
         elif 'base' in model_type:
