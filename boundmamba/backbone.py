@@ -12,9 +12,7 @@ except ImportError:
 
 class TriDimensionalInteraction(nn.Module):
     """
-    [NOVEL CONTRIBUTION] Tri-Dimensional Temporal Interaction (TDTI).
-    Extracts Channel, Height, and Width attentions from the difference features
-    and injects them back to guide the Siamese encoders.
+    Tri-Dimensional Temporal Interaction (TDTI).
     """
     def __init__(self, dim):
         super().__init__()
@@ -33,7 +31,7 @@ class TriDimensionalInteraction(nn.Module):
         # 2. Height Branch (Strip Pooling Vertical)
         self.height_gate = nn.Sequential(
             nn.Conv2d(dim, mid_dim, kernel_size=1),
-            nn.BatchNorm2d(mid_dim),
+            nn.GroupNorm(16, mid_dim), # Unified to GroupNorm
             nn.ReLU(inplace=True),
             nn.Conv2d(mid_dim, dim, kernel_size=1),
             nn.Sigmoid()
@@ -42,50 +40,38 @@ class TriDimensionalInteraction(nn.Module):
         # 3. Width Branch (Strip Pooling Horizontal)
         self.width_gate = nn.Sequential(
             nn.Conv2d(dim, mid_dim, kernel_size=1),
-            nn.BatchNorm2d(mid_dim),
+            nn.GroupNorm(16, mid_dim), # Unified to GroupNorm
             nn.ReLU(inplace=True),
             nn.Conv2d(mid_dim, dim, kernel_size=1),
             nn.Sigmoid()
         )
         
-        # Learnable injection factor (Zero-Init preserves pretrained weights initially)
         self.gamma = nn.Parameter(torch.zeros(1))
 
     def forward(self, x1, x2):
-        # 1. Compute Raw Difference
         diff = torch.abs(x1 - x2)
         
-        # 2. Attentions
         att_c = self.channel_gate(diff) 
         diff_h = diff.mean(dim=3, keepdim=True)
         att_h = self.height_gate(diff_h)
         diff_w = diff.mean(dim=2, keepdim=True)
         att_w = self.width_gate(diff_w)
         
-        # 3. Combine Attentions (Fixing the Attention Collapse Bottleneck)
-        combined_att = (att_c + att_h + att_w) / 3.0
+        combined_att = torch.max(torch.max(att_c, att_h), att_w)
         
-        # 4. Residual Injection
         x1_out = x1 + self.gamma * (x1 * combined_att)
         x2_out = x2 + self.gamma * (x2 * combined_att)
         
         return x1_out, x2_out
 
 class SiameseConvNeXtV2(nn.Module):
-    """
-    Siamese ConvNeXt V2 with Tri-Dimensional Temporal Interaction.
-    """
     def __init__(self, model_type='convnextv2_tiny', in_chans=3, checkpoint_path=None, drop_path_rate=0.2):
         super().__init__()
         
         print(f"[Backbone] Initializing {model_type} with TDTI Interaction...")
         
-        # Determine whether to download automatically or use local weights
         download_pretrained = True if checkpoint_path is None else False
-        if download_pretrained:
-            print("[Backbone] No local weights provided. Will attempt to download from TIMM/HuggingFace Hub...")
 
-        # Robust Download Logic to handle Kaggle/HuggingFace network drops (UnexpectedEof)
         max_retries = 3
         for attempt in range(max_retries):
             try:
@@ -97,24 +83,17 @@ class SiameseConvNeXtV2(nn.Module):
                     num_classes=0,
                     drop_path_rate=drop_path_rate
                 )
-                break # Success, break out of retry loop
+                break
             except Exception as e:
                 print(f"[Backbone] WARNING: Model creation/download failed on attempt {attempt + 1}/{max_retries}.")
-                print(f"[Backbone] Error details: {e}")
-                
                 if attempt < max_retries - 1:
-                    print("[Backbone] Kaggle network likely dropped the connection. Clearing corrupted cache and retrying in 5 seconds...")
-                    # Clear the potentially corrupted partial download
                     cache_dir = os.path.expanduser('~/.cache/huggingface/hub')
                     if os.path.exists(cache_dir):
                         shutil.rmtree(cache_dir, ignore_errors=True)
                     time.sleep(5)
                 else:
-                    print("[Backbone] FATAL: Failed to download weights after 3 attempts.")
-                    print("[Backbone] Workaround: Download the weights manually, upload as a Kaggle dataset, and pass via --weights")
                     raise e
 
-        # Local Loading Logic (Only triggers if a path is explicitly provided)
         if checkpoint_path and os.path.isfile(checkpoint_path):
             print(f"[Backbone] Loading local weights from {checkpoint_path}")
             try:
@@ -127,11 +106,9 @@ class SiameseConvNeXtV2(nn.Module):
                     state_dict = state_dict['model']
                 
                 missing, unexpected = self.base_model.load_state_dict(state_dict, strict=False)
-                print(f"[Backbone] Local weights loaded successfully. Missing Keys: {len(missing)}")
             except Exception as e:
                 print(f"[Backbone] Error loading local weights: {e}")
         
-        # Set dimensions based on ConvNeXt architecture variants
         if 'tiny' in model_type or 'small' in model_type: 
             self.dims = [96, 192, 384, 768]
         elif 'base' in model_type:
@@ -139,14 +116,11 @@ class SiameseConvNeXtV2(nn.Module):
         elif 'large' in model_type:
             self.dims = [192, 384, 768, 1536]
         else: 
-            self.dims = [96, 192, 384, 768] # Default
-        
-        print(f"[Backbone] Encoded Feature Dims: {self.dims}")
+            self.dims = [96, 192, 384, 768] 
 
         self.stem = self.base_model.stem
         self.stages = self.base_model.stages
         
-        # Insert Tri-Dimensional Interaction after each stage
         self.interactions = nn.ModuleList([
             TriDimensionalInteraction(dim) for dim in self.dims
         ])
@@ -162,7 +136,6 @@ class SiameseConvNeXtV2(nn.Module):
             f1 = stage(f1)
             f2 = stage(f2)
             
-            # TDTI Interaction
             f1, f2 = self.interactions[i](f1, f2)
             
             features_1.append(f1)
