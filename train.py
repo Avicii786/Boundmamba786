@@ -240,7 +240,7 @@ def main():
         save_top_k=2, 
         save_last=False, 
         filename="best_model", 
-        save_weights_only=True
+        save_weights_only=False
     )
     
     early_stop_callback = EarlyStopping(
