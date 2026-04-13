@@ -111,7 +111,7 @@ class BoundMambaLoss(nn.Module):
         self.lambda_ss = 1.0 
         self.lambda_cd = 2.0  
         self.lambda_bd = 0.5  
-        self.lambda_scl = 0.1 # [RELAXED FIX] Dropped from 0.5. Let the network make bolder predictions.
+        self.lambda_scl = 0.25 # [RELAXED FIX] Dropped from 0.5. Let the network make bolder predictions.
 
     def forward(self, outputs, targets):
         pred_ss1, pred_ss2, pred_cd, pred_bd = outputs
