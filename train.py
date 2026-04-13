@@ -213,9 +213,11 @@ def main():
     parser.add_argument('--patience', type=int, default=15, help='Patience for early stopping')
     parser.add_argument('--save_dir', type=str, default='/kaggle/working/checkpoints')
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--resume_ckpt', type=str, default=None, help='Path to checkpoint to resume training')
     
     parser.add_argument('--accelerator', type=str, default='gpu', choices=['gpu', 'tpu', 'cpu', 'auto'])
     parser.add_argument('--devices', type=str, default='auto')
+    
     args = parser.parse_args()
 
     pl.seed_everything(args.seed, workers=True)
@@ -272,7 +274,7 @@ def main():
         print(f"\n🚀 BoundNeXt: {args.model_type.upper()} | Accel: {args.accelerator.upper()} | Eff. Batch: {eff_bs} | Split Monitoring: ON")
         print(f"🛑 Early Stopping: ON (Patience: {args.patience} Epochs)")
     
-    trainer.fit(model, train_loader, val_loader)
+    trainer.fit(model, train_loader, val_loader, ckpt_path=args.resume_ckpt)
 
 if __name__ == '__main__':
     main()
