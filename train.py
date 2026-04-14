@@ -236,7 +236,7 @@ def main():
         accumulate_grad_batches=args.accumulate_grad_batches,
         gradient_clip_val=1.0, 
         callbacks=[checkpoint_callback, early_stop_callback, CleanupCallback()], 
-        enable_progress_bar=False, 
+        enable_progress_bar=True, 
         logger=False
     )
 
