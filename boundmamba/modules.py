@@ -16,7 +16,7 @@ class ASPP(nn.Module):
         )
         self.out_conv = nn.Sequential(
             nn.Conv2d(out_channels * 5, out_channels, 1, bias=False),
-            nn.GroupNorm(16, out_channels), # [SOTA BATCH FIX] GroupNorm instead of BatchNorm
+            nn.GroupNorm(16, out_channels), 
             nn.ReLU(inplace=True),
             nn.Dropout(0.1)
         )
@@ -37,24 +37,24 @@ class BGI_Module(nn.Module):
         super().__init__()
         self.spatial_gate = nn.Sequential(
             nn.Conv2d(1, 16, 3, padding=1),
-            nn.GroupNorm(8, 16), # [SOTA BATCH FIX]
+            nn.GroupNorm(8, 16), 
             nn.ReLU(inplace=True),
             nn.Conv2d(16, 1, 1),
             nn.Sigmoid()
         )
         self.cd_fusion = nn.Sequential(
             nn.Conv2d(in_channels * 3, in_channels, 3, padding=1),
-            nn.GroupNorm(16, in_channels), # [SOTA BATCH FIX]
+            nn.GroupNorm(16, in_channels), 
             nn.ReLU(inplace=True)
         )
         self.ss1_fusion = nn.Sequential(
             nn.Conv2d(in_channels * 2, in_channels, 3, padding=1),
-            nn.GroupNorm(16, in_channels), # [SOTA BATCH FIX]
+            nn.GroupNorm(16, in_channels), 
             nn.ReLU(inplace=True)
         )
         self.ss2_fusion = nn.Sequential(
             nn.Conv2d(in_channels * 2, in_channels, 3, padding=1),
-            nn.GroupNorm(16, in_channels), # [SOTA BATCH FIX]
+            nn.GroupNorm(16, in_channels), 
             nn.ReLU(inplace=True)
         )
 
@@ -74,24 +74,29 @@ class BGI_Module(nn.Module):
 class UWFF_Head(nn.Module):
     def __init__(self, in_channels, num_classes):
         super().__init__()
+        # [SOTA FIX] Late-Stage Task Fusion: We expand in_channels to accept the CD features
         self.ss1_head = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels, 3, padding=1),
-            nn.GroupNorm(16, in_channels), # [SOTA BATCH FIX]
+            nn.Conv2d(in_channels * 2, in_channels, 3, padding=1),
+            nn.GroupNorm(16, in_channels), 
             nn.ReLU(inplace=True),
             nn.Conv2d(in_channels, num_classes, 1)
         )
         self.ss2_head = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels, 3, padding=1),
-            nn.GroupNorm(16, in_channels), # [SOTA BATCH FIX]
+            nn.Conv2d(in_channels * 2, in_channels, 3, padding=1),
+            nn.GroupNorm(16, in_channels), 
             nn.ReLU(inplace=True),
             nn.Conv2d(in_channels, num_classes, 1)
         )
         self.cd_head = nn.Sequential(
             nn.Conv2d(in_channels, in_channels, 3, padding=1),
-            nn.GroupNorm(16, in_channels), # [SOTA BATCH FIX]
+            nn.GroupNorm(16, in_channels), 
             nn.ReLU(inplace=True),
             nn.Conv2d(in_channels, 1, 1)
         )
 
     def forward(self, x1, x2, cd_f):
-        return self.ss1_head(x1), self.ss2_head(x2), self.cd_head(cd_f)
+        # [SOTA FIX] The final 1x1 classifications must explicitly see the final change features
+        out_ss1 = self.ss1_head(torch.cat([x1, cd_f], dim=1))
+        out_ss2 = self.ss2_head(torch.cat([x2, cd_f], dim=1))
+        out_cd = self.cd_head(cd_f)
+        return out_ss1, out_ss2, out_cd
