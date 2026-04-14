@@ -35,34 +35,10 @@ class CleanupCallback(Callback):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
+# [SOTA FIX] Mixup completely disabled. It creates artificial 90-degree 
+# boundary corners which corrupts the Boundary Head's learning of real structures.
 def bitemporal_mixup(t1, t2, l1, l2, bcd, alpha=1.0):
-    if np.random.rand() > 0.25: 
-        return t1, t2, l1, l2, bcd
-
-    B, C, H, W = t1.shape
-    index = torch.randperm(B).to(t1.device)
-
-    lam = np.random.beta(alpha, alpha)
-    cut_rat = np.clip(np.sqrt(1. - lam), 0.1, 0.6) 
-    cut_w = int(W * cut_rat)
-    cut_h = int(H * cut_rat)
-
-    cx = np.random.randint(W)
-    cy = np.random.randint(H)
-
-    bbx1 = np.clip(cx - cut_w // 2, 0, W)
-    bby1 = np.clip(cy - cut_h // 2, 0, H)
-    bbx2 = np.clip(cx + cut_w // 2, 0, W)
-    bby2 = np.clip(cy + cut_h // 2, 0, H)
-
-    t1[:, :, bby1:bby2, bbx1:bbx2] = t1[index, :, bby1:bby2, bbx1:bbx2]
-    t2[:, :, bby1:bby2, bbx1:bbx2] = t2[index, :, bby1:bby2, bbx1:bbx2]
-    
-    l1[:, bby1:bby2, bbx1:bbx2] = l1[index, bby1:bby2, bbx1:bbx2]
-    l2[:, bby1:bby2, bbx1:bbx2] = l2[index, bby1:bby2, bbx1:bbx2]
-    bcd[:, bby1:bby2, bbx1:bbx2] = bcd[index, bby1:bby2, bbx1:bbx2]
-
-    return t1, t2, l1, l2, bcd
+    return t1, t2, l1, l2, bcd 
 
 class BoundNeXtLightning(pl.LightningModule):
     def __init__(self, args):
@@ -100,11 +76,11 @@ class BoundNeXtLightning(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         t1, t2, l1, l2, gt_cd = batch['img_A'], batch['img_B'], batch['sem1'], batch['sem2'], batch['bcd']
         
+        # Mixup is bypassed via the modified function above.
         t1, t2, l1, l2, gt_cd = bitemporal_mixup(t1, t2, l1, l2, gt_cd)
         gt_bd = extract_composite_boundary(gt_cd, l1, l2)
         
         outputs, aux_outputs = self(t1, t2)
-        pred_ss1, pred_ss2, pred_cd, pred_bd = outputs
         
         loss_main, loss_dict = self.criterion(outputs, (l1, l2, gt_cd, gt_bd))
         
@@ -136,7 +112,6 @@ class BoundNeXtLightning(pl.LightningModule):
         p_ss2 = torch.argmax(logits_ss2, dim=1)
         p_cd = (torch.sigmoid(logits_cd) > 0.5).long().squeeze(1)
         
-        # --- Dual-Way Conflict Resolution ---
         semantic_agree = (p_ss1 == p_ss2)
         p_cd = torch.where(semantic_agree, torch.zeros_like(p_cd), p_cd)
 
@@ -183,18 +158,17 @@ class BoundNeXtLightning(pl.LightningModule):
             {'params': decoder_params, 'lr': self.args.lr}
         ], weight_decay=0.05)
         
-        # [SPLIT MONITORING FIX]
-        # Scheduler watches 'val_loss' (mode='min'). It won't cut the LR if the network 
-        # is still successfully minimizing the cross-entropy/probability distribution.
+        # [SOTA FIX] Monitoring `val_loss` creates premature LR drops because of OHEM/SCL volatility.
+        # Monitoring `val_score` allows the model to ride out the noise and find the true maxima.
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=8, min_lr=1e-6, verbose=False 
+            optimizer, mode='max', factor=0.5, patience=6, min_lr=1e-6, verbose=False 
         )
         
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "monitor": "val_loss", # Changed from val_score to val_loss
+                "monitor": "val_score", 
                 "frequency": 1
             }
         }
@@ -230,9 +204,6 @@ def main():
 
     model = BoundNeXtLightning(args)
     
-    # [SPLIT MONITORING FIX]
-    # Checkpoint and Early Stopping continue to watch 'val_score' (mode='max').
-    # We strictly enforce that only the highest performing task-metric model is saved.
     checkpoint_callback = ModelCheckpoint(
         dirpath=args.save_dir, 
         monitor="val_score", 
